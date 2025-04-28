@@ -11,10 +11,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores.pgvector import PGVector
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores.pgvector import PGVector
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
 
 # 1) Carga variables de entorno (.env)
 load_dotenv()
@@ -24,7 +25,7 @@ PG_CONN = os.environ["PG_CONN"]
 PDF_DIR = Path("docs")
 
 # 3) Embeddings: e5-mistral (open-source, muy bueno)
-EMBED_MODEL = "intfloat/e5-mistral-7b-instruct"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 embeddings = HuggingFaceEmbeddings(
     model_name=EMBED_MODEL,
     # Usa GPU si tenés; de lo contrario queda en CPU
