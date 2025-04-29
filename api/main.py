@@ -4,40 +4,57 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from langchain.chains import RetrievalQA
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores.pgvector import PGVector
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores.pgvector import PGVector
 from langchain_deepseek import ChatDeepSeek
+
+# Reranker
+
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain.retrievers import ContextualCompressionRetriever
+
+from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+load_dotenv()
 
-load_dotenv()  # carga PG_CONN y DEEPSEEK_API_KEY
-
-# ---------- Configuración ----------
 PG_CONN = os.environ["PG_CONN"]
 
-# Embeddings deben ser IGUALES a los que usaste al indexar
-emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# Embeddings: BGE-base, igual que en ingest.py
+emb = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-base-en-v1.5",
+    model_kwargs={"device": "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"},
+)
 
+# Vector store y retriever base (k = 10 para rerank)
 vectorstore = PGVector(
     embedding_function=emb,
-    collection_name="manual_demo",
+    collection_name="manual_bge_base",
     connection_string=PG_CONN,
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+base_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
 
-llm = ChatDeepSeek(
-    api_key=os.environ["DEEPSEEK_API_KEY"],
-    model="deepseek-chat"   # o el ID de modelo que uses, p. ej. "deepseek-r1"
+cross_enc = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+reranker = CrossEncoderReranker(model=cross_enc, top_n=4)
+
+retriever = ContextualCompressionRetriever(
+    base_compressor=reranker,
+    base_retriever=base_retriever,
 )
 
+# LLM DeepSeek
+llm = ChatDeepSeek(
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    model="deepseek-chat",
+    temperature=0,
+)
 
-# ---------- Prompt con tu instrucción ----------
+# Prompt con guardrail
 prompt_tmpl = """
 Eres un asistente especializado en consultar el manual proporcionado.
-Responde **exclusivamente** con la información encontrada en el CONTEXTO.
-Si la respuesta no está en el manual, contesta exactamente:
+Responde **solo** con información del CONTEXTO.
+Si no encuentras la respuesta, di exactamente:
 "La información solicitada no se encuentra en este manual."
 
 CONTEXTO:
@@ -46,15 +63,10 @@ CONTEXTO:
 PREGUNTA:
 {question}
 
-RESPUESTA (en español):
+RESPUESTA:
 """
+prompt = PromptTemplate(template=prompt_tmpl, input_variables=["context", "question"])
 
-prompt = PromptTemplate(
-    template=prompt_tmpl,
-    input_variables=["context", "question"],
-)
-
-# ---------- Cadena QA con prompt personalizado ----------
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
     retriever=retriever,
@@ -63,30 +75,28 @@ qa_chain = RetrievalQA.from_chain_type(
     return_source_documents=True,
 )
 
-# ---------- FastAPI ----------
+# -------- FastAPI ----------
 app = FastAPI(title="RAG-as-a-Service")
 
 class Question(BaseModel):
     query: str
-    k: int | None = 4  # nº de trozos opcional
+    k: int | None = None  # opcionalmente sobre-escribe k
 
 @app.post("/chat")
-def chat(question: Question):
+def chat(q: Question):
     try:
-        result = qa_chain(
-            {"query": question.query},
-            {"k": question.k} if question.k else None,
-        )
-        answer = {
+        # pasa k si llega
+        kwargs = {"k": q.k} if q.k else {}
+        result = qa_chain({"query": q.query}, kwargs)
+        return {
             "answer": result["result"],
             "sources": [
                 {
-                    "text": doc.page_content[:200] + "…",
-                    "file": doc.metadata.get("source"),
+                    "file": d.metadata.get("source"),
+                    "snippet": d.page_content[:200] + "…",
                 }
-                for doc in result["source_documents"]
+                for d in result["source_documents"]
             ],
         }
-        return answer
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

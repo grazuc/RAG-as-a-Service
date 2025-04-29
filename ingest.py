@@ -1,78 +1,66 @@
 """
 ingest.py
 ----------
-Lee todos los PDFs que encuentre en la carpeta ./docs,
-los trocea, genera embeddings con e5-mistral y
-los guarda en la colección 'manual_demo' de PGVector.
+Ingiere todos los PDFs en ./docs, los trocea, genera
+embeddings con BAAI/bge-base-en-v1.5 (768 dims) y
+los guarda en la colección 'manual_bge_base'.
 """
 
 import os
 from pathlib import Path
-
 from dotenv import load_dotenv
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores.pgvector import PGVector
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores.pgvector import PGVector
 
-
-# 1) Carga variables de entorno (.env)
+# 1) Entorno
 load_dotenv()
 PG_CONN = os.environ["PG_CONN"]
 
-# 2) Directorio con tus PDFs
 PDF_DIR = Path("docs")
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 
-# 3) Embeddings: e5-mistral (open-source, muy bueno)
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 embeddings = HuggingFaceEmbeddings(
     model_name=EMBED_MODEL,
-    # Usa GPU si tenés; de lo contrario queda en CPU
     model_kwargs={"device": "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"},
 )
 
-# 4) Configura cómo vamos a trocear el texto
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=800,      # aprox. medio folio
-    chunk_overlap=100,   # solapamos un poco para no cortar ideas
+    chunk_size=500,
+    chunk_overlap=80,
     separators=["\n\n", "\n", " ", ""],
 )
 
 def ingest_pdf(pdf_path: Path):
-    """Carga, trocea y devuelve una lista de Document objects."""
     loader = PyPDFLoader(str(pdf_path))
-    docs = loader.load()  # lista de Document (uno por página)
-
-    # Metadata: guardamos el nombre del archivo para trazar la fuente
+    docs = loader.load()
     for d in docs:
         d.metadata["source"] = pdf_path.name
-
-    # Troceamos la lista completa
     return splitter.split_documents(docs)
 
 def main():
-    print("🔍 Buscando PDFs en", PDF_DIR.resolve())
+    print("🔍 PDFs en", PDF_DIR.resolve())
     pdf_files = list(PDF_DIR.glob("*.pdf"))
     if not pdf_files:
-        raise FileNotFoundError("⚠️  No se encontraron PDFs en ./docs")
+        raise FileNotFoundError("⚠️  No hay PDFs en ./docs")
 
-    all_chunks = []
+    chunks = []
     for pdf in pdf_files:
-        print(f"📄 Ingestando {pdf.name} …")
-        all_chunks.extend(ingest_pdf(pdf))
+        print(f"📄 {pdf.name}")
+        chunks.extend(ingest_pdf(pdf))
 
-    print(f"✂️  Total de segmentos: {len(all_chunks)}")
+    print(f"✂️  Segmentos: {len(chunks)}")
 
-    # 5) Conectamos a PGVector y guardamos
-    store = PGVector.from_documents(
-        documents=all_chunks,
+    PGVector.from_documents(
+        documents=chunks,
         embedding=embeddings,
-        collection_name="manual_demo",        # puedes tener varias colecciones
+        collection_name="manual_bge_base",
         connection_string=PG_CONN,
     )
 
-    print(f"✅ Ingestados {len(all_chunks)} chunks en 'manual_demo'")
+    print("✅ Ingesta terminada en 'manual_bge_base'")
 
 if __name__ == "__main__":
     main()
