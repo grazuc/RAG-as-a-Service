@@ -1,0 +1,12 @@
+2025-04-30 05:10:13,635 - __main__ - INFO - Configuración cargada: IngestConfig(docs_dir=WindowsPath('docs'), embed_model='intfloat/multilingual-e5-base', collection_name='manual_e5_multi', chunk_size=500, chunk_overlap=80, batch_size=100, max_workers=4, allowed_languages={'en', 'es'}, file_extensions=['pdf', 'txt', 'docx', 'md'], deduplication=True, similarity_threshold=0.95)
+2025-04-30 05:10:20,855 - sentence_transformers.SentenceTransformer - INFO - Load pretrained SentenceTransformer: intfloat/multilingual-e5-base
+2025-04-30 05:11:28,796 - __mp_main__ - INFO - Procesando manual.pdf
+2025-04-30 05:43:41,325 - __main__ - INFO - Configuración cargada: IngestConfig(docs_dir=WindowsPath('docs'), embed_model='intfloat/multilingual-e5-base', collection_name='manual_e5_multi', chunk_size=500, chunk_overlap=80, batch_size=100, max_workers=4, allowed_languages={'es', 'en'}, file_extensions=['pdf', 'txt', 'docx', 'md'], deduplication=True, similarity_threshold=0.95)
+2025-04-30 05:43:48,492 - sentence_transformers.SentenceTransformer - INFO - Load pretrained SentenceTransformer: intfloat/multilingual-e5-base
+2025-04-30 05:43:54,567 - __mp_main__ - INFO - Procesando manual.pdf
+2025-04-30 05:54:09,993 - __main__ - INFO - Configuración cargada: IngestConfig(docs_dir=WindowsPath('docs'), embed_model='intfloat/multilingual-e5-base', collection_name='manual_e5_multi1', chunk_size=500, chunk_overlap=80, batch_size=100, max_workers=4, allowed_languages={'en', 'es'}, file_extensions=['pdf', 'txt', 'docx', 'md'], deduplication=True, similarity_threshold=0.95)
+2025-04-30 05:54:16,491 - sentence_transformers.SentenceTransformer - INFO - Load pretrained SentenceTransformer: intfloat/multilingual-e5-base
+2025-04-30 05:54:22,416 - __mp_main__ - INFO - Procesando manual.pdf
+2025-04-30 06:17:10,560 - __main__ - INFO - Configuración cargada: IngestConfig(docs_dir=WindowsPath('docs'), embed_model='intfloat/multilingual-e5-base', collection_name='manual_e5_multi2', chunk_size=500, chunk_overlap=80, batch_size=100, max_workers=4, allowed_languages={'es', 'en'}, file_extensions=['pdf', 'txt', 'docx', 'md'], deduplication=True, similarity_threshold=0.95)
+2025-04-30 06:17:17,563 - sentence_transformers.SentenceTransformer - INFO - Load pretrained SentenceTransformer: intfloat/multilingual-e5-base
+2025-04-30 06:17:23,795 - __mp_main__ - INFO - Procesando manual.pdf
