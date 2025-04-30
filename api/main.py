@@ -4,82 +4,81 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from transformers import pipeline
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores.pgvector import PGVector
-from langchain_deepseek import ChatDeepSeek
-
-# ---------- imports nuevos ----------
-from langchain_huggingface import HuggingFaceEndpoint
-from langchain.chains import LLMChain
-from langchain.prompts import ChatPromptTemplate
-
-# Reranker
-
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain.retrievers import ContextualCompressionRetriever
-
+from langchain_deepseek import ChatDeepSeek
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+# ───── Carga de env vars ─────
 load_dotenv()
-
 PG_CONN = os.environ["PG_CONN"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
-rewrite_llm = HuggingFaceEndpoint(
-    repo_id="bactrian-x/rewrite-rag-questions",
-    task="text-generation",
-    max_new_tokens=60,
-    temperature=0.1,
+# Carga Flan-T5 Small (mantiene CPU)
+question_rewriter = pipeline(
+    "text2text-generation",
+    model="google/flan-t5-small",
+    device_map="cpu",
+    trust_remote_code=False,
 )
 
-rewrite_prompt = ChatPromptTemplate.from_template(
-    "You will rewrite the user's raw question into a concise search query "
-    "that works best for retrieval.\n\n"
-    "User question: {question}\n\nRewritten query:"
-)
+def rewrite_query(question: str) -> str:
+    # Prompt genérico para todo tipo de docs
+    prompt_text = (
+        "Toma la siguiente pregunta de un usuario y reescríbela de forma breve y "
+        "óptima para que sirva como consulta de búsqueda semántica:\n\n"
+        f"Pregunta original: {question}\n\n"
+        "Consulta optimizada:"
+    )
+    out = question_rewriter(
+        prompt_text,
+        max_new_tokens=60,
+        clean_up_tokenization_spaces=True
+    )
+    rewritten = out[0]["generated_text"].strip()
+    # Si sale muy corto o sin cambios, volvemos a la original
+    if len(rewritten.split()) < 2:
+        return question
+    return rewritten
 
-rewrite_chain = LLMChain(llm=rewrite_llm, prompt=rewrite_prompt)
 
-def rewrite(question: str) -> str:
-    rewritten = rewrite_chain.run({"question": question}).strip()
-    return rewritten or question
-
-# Embeddings: BGE-base, igual que en ingest.py
+# ───── Embeddings + VectorStore ─────
 emb = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-base-en-v1.5",
-    model_kwargs={"device": "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"},
+    model_name="intfloat/multilingual-e5-base",
+    model_kwargs={"device": "cpu"},
 )
-
-# Vector store y retriever base (k = 10 para rerank)
 vectorstore = PGVector(
     embedding_function=emb,
-    collection_name="manual_bge_base",
+    collection_name="manual_e5_multi",
     connection_string=PG_CONN,
 )
-base_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
 
+# ───── Retriever base + Reranker ─────
+base_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
 cross_enc = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
 reranker = CrossEncoderReranker(model=cross_enc, top_n=4)
-
-retriever = ContextualCompressionRetriever(
+compression_retriever = ContextualCompressionRetriever(
     base_compressor=reranker,
     base_retriever=base_retriever,
 )
 
-# LLM DeepSeek
+# ───── LLM DeepSeek ─────
 llm = ChatDeepSeek(
-    api_key=os.environ["DEEPSEEK_API_KEY"],
+    api_key=DEEPSEEK_API_KEY,
     model="deepseek-chat",
     temperature=0,
 )
 
-# Prompt con guardrail
-prompt_tmpl = """
-Eres un asistente especializado en consultar el manual proporcionado.
-Responde **solo** con información del CONTEXTO.
-Si no encuentras la respuesta, di exactamente:
-"La información solicitada no se encuentra en este manual."
+# ───── Prompt con guardrail ─────
+prompt = PromptTemplate(
+    template="""
+Eres un asistente que solo responde con información del manual.
+Si no existe, di “La información solicitada no se encuentra en este manual.”
 
 CONTEXTO:
 {context}
@@ -88,31 +87,37 @@ PREGUNTA:
 {question}
 
 RESPUESTA:
-"""
-prompt = PromptTemplate(template=prompt_tmpl, input_variables=["context", "question"])
+""",
+    input_variables=["context", "question"],
+)
 
+# ───── Cadena QA ─────
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
-    retriever=retriever,
+    retriever=compression_retriever,
     chain_type="stuff",
     chain_type_kwargs={"prompt": prompt},
     return_source_documents=True,
 )
 
-# -------- FastAPI ----------
+# ───── FastAPI ─────
 app = FastAPI(title="RAG-as-a-Service")
 
 class Question(BaseModel):
     query: str
-    k: int | None = None  # opcionalmente sobre-escribe k
 
 @app.post("/chat")
 def chat(q: Question):
     try:
-        # pasa k si llega
-        kwargs = {"k": q.k} if q.k else {}
-        result = qa_chain({"query": q.query}, kwargs)
+        # 1. Reescribe la pregunta
+        good_query = rewrite_query(q.query)
+
+        # 2. Ejecuta el RAG con esa query
+        result = qa_chain.invoke({"query": good_query})
+
         return {
+            "original_query": q.query,
+            "rewritten_query": good_query,
             "answer": result["result"],
             "sources": [
                 {
@@ -124,3 +129,4 @@ def chat(q: Question):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+

@@ -20,7 +20,7 @@ load_dotenv()
 PG_CONN = os.environ["PG_CONN"]
 
 PDF_DIR = Path("docs")
-EMBED_MODEL = "BAAI/bge-base-en-v1.5"
+EMBED_MODEL = "intfloat/multilingual-e5-base"
 
 embeddings = HuggingFaceEmbeddings(
     model_name=EMBED_MODEL,
@@ -56,11 +56,11 @@ def main():
     PGVector.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name="manual_bge_base",
+        collection_name="manual_e5_multi",
         connection_string=PG_CONN,
     )
 
-    print("✅ Ingesta terminada en 'manual_bge_base'")
+    print("✅ Ingesta terminada en 'manual_e5_multi'")
 
 if __name__ == "__main__":
     main()
