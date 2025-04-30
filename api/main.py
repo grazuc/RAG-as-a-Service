@@ -8,6 +8,11 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_deepseek import ChatDeepSeek
 
+# ---------- imports nuevos ----------
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain.chains import LLMChain
+from langchain.prompts import ChatPromptTemplate
+
 # Reranker
 
 from langchain.retrievers.document_compressors import CrossEncoderReranker
@@ -20,6 +25,25 @@ from langchain.prompts import PromptTemplate
 load_dotenv()
 
 PG_CONN = os.environ["PG_CONN"]
+
+rewrite_llm = HuggingFaceEndpoint(
+    repo_id="bactrian-x/rewrite-rag-questions",
+    task="text-generation",
+    max_new_tokens=60,
+    temperature=0.1,
+)
+
+rewrite_prompt = ChatPromptTemplate.from_template(
+    "You will rewrite the user's raw question into a concise search query "
+    "that works best for retrieval.\n\n"
+    "User question: {question}\n\nRewritten query:"
+)
+
+rewrite_chain = LLMChain(llm=rewrite_llm, prompt=rewrite_prompt)
+
+def rewrite(question: str) -> str:
+    rewritten = rewrite_chain.run({"question": question}).strip()
+    return rewritten or question
 
 # Embeddings: BGE-base, igual que en ingest.py
 emb = HuggingFaceEmbeddings(
