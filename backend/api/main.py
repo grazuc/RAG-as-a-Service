@@ -20,6 +20,8 @@ from langchain_deepseek import ChatDeepSeek
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # Configurar logging
 logging.basicConfig(
@@ -348,6 +350,15 @@ app = FastAPI(
     title="RAG-as-a-Service",
     description="API para consultas RAG sobre manuales",
     version="1.0.0",
+)
+
+# Cors
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # URL de tu frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ───── Modelos de datos ─────
