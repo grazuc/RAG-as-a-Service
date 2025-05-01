@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-base"
     embedding_model: str = "intfloat/multilingual-e5-base"
     llm_model: str = "deepseek-chat"
-    collection_name: str = "manual_e5_multi2"
+    collection_name: str = "manual_e5_multi5"
     initial_retrieval_k: int = 20
     final_docs_count: int = 4
     # La api_key es opcional, si no se proporciona no se verificará
@@ -158,36 +158,139 @@ RESPUESTA:
         return_source_documents=True,
     )
 
+@lru_cache(maxsize=1)
+def get_document_language_stats():
+    """
+    Analiza y devuelve estadísticas sobre los idiomas de los documentos en la base de datos.
+    Cachea los resultados para evitar consultas repetidas.
+    """
+    logger.info("Analizando estadísticas de idiomas en la base de datos...")
+    try:
+        # Obtener documentos
+        vectorstore = PGVector(
+            connection_string=settings.pg_conn,
+            collection_name=settings.collection_name,
+        )
+        
+        # Ejecutar consulta SQL directa para obtener estadísticas de idiomas
+        conn = vectorstore.connection
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT metadata->>'language' as lang, COUNT(*) as count
+                FROM langchain_pg_embedding
+                WHERE collection_name = %s AND metadata->>'language' IS NOT NULL
+                GROUP BY metadata->>'language'
+                ORDER BY count DESC
+            """, (settings.collection_name,))
+            
+            results = cursor.fetchall()
+        
+        # Organizar resultados
+        lang_stats = {}
+        for lang, count in results:
+            lang_stats[lang] = count
+            
+        logger.info(f"Estadísticas de idiomas: {lang_stats}")
+        return lang_stats
+        
+    except Exception as e:
+        logger.error(f"Error al obtener estadísticas de idiomas: {e}")
+        return {}  # En caso de error, devolver diccionario vacío
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
 )
 def rewrite_query(question: str) -> str:
-    """Reescribe la consulta para optimizarla, con reintentos"""
+    """
+    Reescribe la consulta para optimizarla, con reintentos y adaptación de idioma.
+    Si el idioma de la consulta difiere del idioma principal de los documentos,
+    la consulta será traducida para mejorar la recuperación.
+    """
+    # Añadimos logs detallados para cada condición
+    logger.info(f"Analizando consulta: '{question}'")
+    logger.info(f"Longitud de la consulta: {len(question.split())} palabras")
+    
+    # Verificar primera condición
+    short_query = len(question.split()) <= 3
+    has_question_mark = "?" in question
+    has_question_word = any(w in question.lower() for w in ["como", "cómo", "que", "qué", "cuál", "cual", "donde", "dónde", 
+                                                           "how", "what", "where", "which", "why", "when"])
+    
+    logger.info(f"¿Consulta corta (<= 3 palabras)?: {short_query}")
+    logger.info(f"¿Tiene signo de interrogación?: {has_question_mark}")
+    logger.info(f"¿Tiene palabra interrogativa?: {has_question_word}")
+    
     # Verificar si debemos usar el rewriter o no
     # Para consultas cortas y directas, no reescribimos
-    if len(question.split()) <= 8 and ("?" in question or any(w in question.lower() for w in ["como", "cómo", "que", "qué", "cuál", "cual", "donde", "dónde"])):
+    if short_query and (has_question_mark or has_question_word):
         logger.info(f"Consulta corta detectada, se omite reescritura: {question}")
         return question
     
     # Reescribe consultas más complejas
     try:
-        question_rewriter = get_question_rewriter()
+        # Obtener el idioma de la consulta
+        query_lang = detect_language(question)
+        logger.info(f"Idioma detectado de la consulta: {query_lang}")
+        
+        # Obtener estadísticas de idiomas de los documentos
+        doc_langs = get_document_language_stats()
+        
+        if not doc_langs:
+            logger.warning("No se pudieron obtener estadísticas de idiomas de documentos")
+            # Continuar con la reescritura sin adaptación de idioma
+        else:
+            # Encontrar el idioma predominante en los documentos
+            predominant_lang = max(doc_langs, key=doc_langs.get)
+            logger.info(f"Idioma predominante en documentos: {predominant_lang}")
+            
+            # Si el idioma de la consulta difiere del predominante, traducir
+            needs_translation = query_lang and predominant_lang and query_lang != predominant_lang
+            
+            if needs_translation:
+                logger.info(f"Se requiere traducción de '{query_lang}' a '{predominant_lang}'")
+                
+                # Usar DeepSeek para traducir la consulta
+                llm = get_llm()
+                translation_prompt = (
+                    f"Traduce la siguiente consulta de {query_lang} a {predominant_lang}. "
+                    f"Responde SOLO con la traducción, sin explicaciones ni texto adicional:\n\n"
+                    f"{question}"
+                )
+                
+                logger.info(f"Prompt de traducción: {translation_prompt}")
+                
+                translation_response = llm.invoke(translation_prompt)
+                translated_query = translation_response.content.strip()
+                
+                logger.info(f"Consulta traducida: '{translated_query}'")
+                
+                # Reemplazar la consulta original con la traducida
+                question = translated_query
+        
+        logger.info("Intentando reescribir la consulta con DeepSeek...")
+        
+        # Usar el LLM de DeepSeek para reescribir
+        llm = get_llm()
+        
+        # Definir el prompt para reescritura
         prompt_text = (
-            "Eres un experto en búsqueda semántica. Reformula esta consulta para hacerla más "
-            "efectiva para recuperación semántica. Mantén todos los términos técnicos y "
+            "Como experto en búsqueda semántica, reformula esta consulta para hacerla más "
+            "efectiva para recuperación semántica en un sistema RAG. Mantén todos los términos técnicos y "
             "específicos. No agregues información que no esté en la consulta original. "
-            "Mantén la consulta en el mismo idioma.\n\n"
+            "Mantén la consulta en el mismo idioma. Responde ÚNICAMENTE con la consulta reformulada, "
+            "sin explicaciones ni preámbulos.\n\n"
             f"Consulta original: {question}\n\n"
             "Consulta reformulada:"
         )
         
-        out = question_rewriter(
-            prompt_text,
-            max_new_tokens=100,
-            clean_up_tokenization_spaces=True
-        )
-        rewritten = out[0]["generated_text"].strip()
+        logger.info(f"Prompt para DeepSeek: {prompt_text}")
+        
+        # Llamar a DeepSeek para reescritura
+        response = llm.invoke(prompt_text)
+        rewritten = response.content.strip()
+        
+        logger.info(f"Respuesta de DeepSeek: '{rewritten}'")
         
         # Validaciones de calidad para la consulta reescrita
         # 1. Verificar longitud mínima
@@ -200,26 +303,45 @@ def rewrite_query(question: str) -> str:
         rewritten_words = set(w.lower() for w in rewritten.split())
         new_words = rewritten_words - original_words
         
-        # Si más del 50% son palabras nuevas, es sospechoso
-        if len(new_words) > len(original_words) * 0.5:
-            logger.warning(f"Demasiadas palabras nuevas en reescritura, usando original. Nuevas: {new_words}")
-            return question
-            
+        logger.info(f"Palabras originales: {original_words}")
+        logger.info(f"Palabras en reescritura: {rewritten_words}")
+        logger.info(f"Palabras nuevas: {new_words} ({len(new_words)} nuevas de {len(original_words)} originales)")
+        
         # 3. Verificar que se mantengan las palabras clave/técnicas
-        # Identificar posibles términos técnicos (palabras con mayúsculas o poco comunes)
-        potential_technical_terms = [w for w in question.split() if w[0].isupper() or len(w) > 7]
-        for term in potential_technical_terms:
-            if term.lower() not in " ".join(rewritten.lower().split()):
-                logger.warning(f"Término técnico '{term}' perdido en reescritura, usando original")
+        # Solo aplicar si no hubo traducción
+        if not (query_lang and predominant_lang and query_lang != predominant_lang):
+            potential_technical_terms = [w for w in question.split() if w[0].isupper() or len(w) > 7]
+            logger.info(f"Términos técnicos potenciales: {potential_technical_terms}")
+            
+            missing_terms = []
+            for term in potential_technical_terms:
+                if term.lower() not in " ".join(rewritten.lower().split()):
+                    missing_terms.append(term)
+                    
+            logger.info(f"Términos técnicos perdidos: {missing_terms}")
+            
+            if missing_terms:
+                logger.warning(f"Términos técnicos perdidos en reescritura, usando original: {missing_terms}")
                 return question
                 
-        logger.info(f"Consulta reescrita: '{question}' -> '{rewritten}'")
+        logger.info(f"Consulta reescrita exitosamente: '{question}' -> '{rewritten}'")
         return rewritten
         
     except Exception as e:
-        logger.error(f"Error al reescribir consulta: {e}")
+        logger.error(f"Error al reescribir consulta: {e}", exc_info=True)
         # En caso de error, devolvemos la consulta original
         return question
+
+def detect_language(text: str) -> Optional[str]:
+    """Detecta el idioma del texto, devuelve None si falla"""
+    if not text or len(text.strip()) < 20:
+        return None
+    
+    try:
+        return detect(text)
+    except Exception as e:
+        logger.error(f"Error al detectar idioma: {e}")
+        return None
 
 # ───── FastAPI ─────
 app = FastAPI(

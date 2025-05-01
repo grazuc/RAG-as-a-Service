@@ -17,3 +17,4 @@ pgvector
 
 pydantic
 pypdf
+langdetect
