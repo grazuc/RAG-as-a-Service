@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 class IngestConfig:
     docs_dir: Path = Path("docs")
     embed_model: str = "intfloat/multilingual-e5-base"
-    collection_name: str = "manual_e5_multi5"
+    collection_name: str = "manual_e5_multi7"
     chunk_size: int = 500
     chunk_overlap: int = 80
     batch_size: int = 100
@@ -75,7 +75,7 @@ def load_config() -> Tuple[IngestConfig, str]:
                         help="Directorio con documentos a ingerir")
     parser.add_argument("--model", type=str, default="intfloat/multilingual-e5-base",
                         help="Modelo de embeddings a utilizar")
-    parser.add_argument("--collection", type=str, default="manual_e5_multi5",
+    parser.add_argument("--collection", type=str, default="manual_e5_multi7",
                         help="Nombre de la colección en PGVector")
     parser.add_argument("--chunk-size", type=int, default=500,
                         help="Tamaño de los chunks de texto")
