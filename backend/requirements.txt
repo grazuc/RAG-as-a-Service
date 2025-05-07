@@ -10,7 +10,9 @@ nest_asyncio
 
 sentence-transformers
 transformers
+sentencepiece
 accelerate
+sacremoses
 huggingface-hub
 pypdfium2
 torch

@@ -5,50 +5,50 @@ import logging
 from typing import List, Dict, Any, Optional, Union, Tuple
 from functools import lru_cache
 import json
+import asyncio
+from contextlib import asynccontextmanager
+import nest_asyncio
+from datetime import datetime, timedelta
+from collections import defaultdict
+import hashlib
+import sys
+import multiprocessing
+import psutil
+import torch
+import traceback
+import psycopg2
+import warnings
+from langdetect import detect, LangDetectException
+from asyncio import TimeoutError
+import async_timeout
 
 from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict, validator, root_validator
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
+from pydantic import BaseModel, Field, ConfigDict, validator, root_validator, model_validator
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
-from transformers import pipeline
+from langchain.chains import LLMChain, RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.schema import Document
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_deepseek import ChatDeepSeek
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain.callbacks.manager import CallbackManager
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+
+from transformers import pipeline
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
-from fastapi.middleware.cors import CORSMiddleware
-from langchain.schema import Document
-from datetime import datetime, timedelta
-from fastapi import Depends, HTTPException, Request
-from starlette.middleware.base import BaseHTTPMiddleware
-import time
-from collections import defaultdict
-from langdetect import detect, LangDetectException
-import psycopg2
-import traceback
-import hashlib
-import sys
-import multiprocessing
-import psutil
-import torch
 
+from .translation import translate_text
 
-# MODIFICADO: Importar dependencias adicionales para health check y rendimiento
-from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
-import asyncio
-from contextlib import asynccontextmanager
-from pydantic import model_validator
-# Import section at top of file (add after other imports)
-import nest_asyncio
-nest_asyncio.apply()  # Apply nest_asyncio early to allow nested event loops
-
-# Configurar logging
+# MODIFICADO: Configuración de logging mejorada
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -59,7 +59,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ───── Configuración ─────
+# MODIFICADO: Configuración mejorada con validación
 class Settings(BaseSettings):
     pg_conn: str
     deepseek_api_key: str
@@ -68,49 +68,274 @@ class Settings(BaseSettings):
     embedding_model: str = "intfloat/multilingual-e5-base"
     llm_model: str = "deepseek-chat"
     collection_name: str = "manual_e5_multi"
-    initial_retrieval_k: int = 20
-    final_docs_count: int = 4
+    initial_retrieval_k: int = Field(default=20, ge=1, le=100)
+    final_docs_count: int = Field(default=4, ge=1, le=20)
     api_key: Optional[str] = None
-    cache_ttl_hours: int = 6
-    environment: str = "production"  # MODIFICADO: Añadido para distinguir entornos
-    cors_origins: List[str] = Field(default_factory=lambda: ["*"])  # MODIFICADO: Configuración de CORS
-    
+    cache_ttl_hours: int = Field(default=6, ge=1, le=24)
+    environment: str = Field(default="production", pattern="^(production|development|testing)$")
+    cors_origins: List[str] = Field(default_factory=lambda: ["*"])
+    query_rewrite_strategy: str = Field(default="original_only", pattern="^(original_only|rewrite_only|concatenate)$")
+    max_retries: int = Field(default=3, ge=1, le=5)
+    timeout_seconds: int = Field(default=30, ge=5, le=120)
+    batch_size: int = Field(default=16, ge=1, le=64)
+    max_concurrent_requests: int = Field(default=100, ge=10, le=1000)
+    query_timeout: int = Field(default=60, ge=30, le=300)  # Main query timeout in seconds
+    translation_timeout: int = Field(default=10, ge=5, le=30)  # Translation timeout in seconds
+    retrieval_timeout: int = Field(default=20, ge=10, le=60)  # Document retrieval timeout in seconds
+
+    @model_validator(mode='after')
+    def validate_settings(self):
+        if self.environment == "production" and self.cors_origins == ["*"]:
+            logger.warning("Production environment with wildcard CORS origins is not recommended")
+        return self
+
     class Config:
         env_file = ".env"
         case_sensitive = False
 
-# MODIFICADO: Gestión de lifespan para cierre limpio de recursos
+# MODIFICADO: Funciones cacheadas para componentes
+@lru_cache(maxsize=1)
+def get_llm():
+    """Inicializa y retorna el modelo LLM"""
+    try:
+        if settings.llm_model == "deepseek-chat":
+            callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
+            return ChatDeepSeek(
+                api_key=settings.deepseek_api_key,
+                model_name="deepseek-chat",
+                temperature=0.3,
+                max_tokens=1000,
+                callback_manager=callback_manager
+            )
+        else:
+            raise ValueError(f"Modelo LLM no soportado: {settings.llm_model}")
+    except Exception as e:
+        logger.error(f"Error al inicializar LLM: {e}")
+        raise RuntimeError(f"No se pudo inicializar el modelo LLM: {e}")
+
+@lru_cache(maxsize=1)
+def get_qa_prompt():
+    """Retorna el prompt para el QA chain"""
+    return PromptTemplate(
+        template="""Eres un asistente experto que ayuda a responder preguntas basándose en la documentación proporcionada.
+        
+Utiliza SOLO la información del siguiente contexto para responder la pregunta. Si la información no es suficiente para responder,
+indica claramente que no puedes responder basándote solo en el contexto proporcionado.
+
+Contexto:
+{context}
+
+Pregunta:
+{question}
+
+Respuesta:""",
+        input_variables=["context", "question"]
+    )
+
+@lru_cache(maxsize=1)
+def get_qa_chain():
+    """Inicializa y retorna el QA chain"""
+    try:
+        return LLMChain(
+            llm=get_llm(),
+            prompt=get_qa_prompt(),
+            verbose=True
+        )
+    except Exception as e:
+        logger.error(f"Error al inicializar QA chain: {e}")
+        raise RuntimeError(f"No se pudo inicializar el QA chain: {e}")
+
+@lru_cache(maxsize=1)
+async def get_deepseek_query_rewriter_llm():
+    """Inicializa y retorna el LLM para reescritura de consultas"""
+    try:
+        return ChatDeepSeek(
+            api_key=settings.deepseek_api_key,
+            model_name="deepseek-chat",
+            temperature=0.2,
+            max_tokens=200
+        )
+    except Exception as e:
+        logger.warning(f"Error al inicializar LLM para reescritura: {e}")
+        return None
+
+# MODIFICADO: Función para logging de métricas
+async def log_query_metrics(query: str, num_sources: int, execution_time: float, language: Optional[str] = None):
+    """Registra métricas de la consulta para análisis"""
+    try:
+        metrics = {
+            "timestamp": datetime.now().isoformat(),
+            "query_length": len(query),
+            "num_sources": num_sources,
+            "execution_time": execution_time,
+            "language": language or "unknown"
+        }
+        logger.info(f"Métricas de consulta: {json.dumps(metrics)}")
+    except Exception as e:
+        logger.error(f"Error al registrar métricas: {e}")
+
+# MODIFICADO: Función para fusionar información de documentos
+def merge_document_info(docs: List[Document]) -> List[Document]:
+    """Fusiona documentos consecutivos del mismo origen para mejor contexto"""
+    if not docs:
+        return []
+        
+    merged = []
+    current_doc = None
+    
+    for doc in docs:
+        if not current_doc:
+            current_doc = doc
+            continue
+            
+        # Si los documentos son consecutivos y del mismo origen, fusionarlos
+        if (current_doc.metadata.get("source") == doc.metadata.get("source") and
+            abs(current_doc.metadata.get("chunk_index", 0) - doc.metadata.get("chunk_index", 0)) == 1):
+            
+            current_doc.page_content += "\n\n" + doc.page_content
+            # Actualizar metadatos
+            if "page_range" in current_doc.metadata:
+                current_doc.metadata["page_range"] = f"{current_doc.metadata['page_range']}-{doc.metadata.get('page', '')}"
+            else:
+                current_doc.metadata["page_range"] = f"{current_doc.metadata.get('page', '')}-{doc.metadata.get('page', '')}"
+        else:
+            merged.append(current_doc)
+            current_doc = doc
+    
+    if current_doc:
+        merged.append(current_doc)
+    
+    return merged
+
+# MODIFICADO: Gestión de lifespan mejorada
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicialización
     logger.info("Iniciando aplicación API RAG")
     load_dotenv()
     
-    # Entregar control a la aplicación
+    # Inicializar recursos
+    try:
+        # Verificar conexión a la base de datos
+        conn = psycopg2.connect(settings.pg_conn)
+        conn.close()
+        logger.info("Conexión a base de datos verificada")
+        
+        # Verificar GPU si está disponible
+        if torch.cuda.is_available():
+            logger.info(f"GPU disponible: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Memoria GPU: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        else:
+            logger.info("No se detectó GPU, usando CPU")
+            
+        # Verificar memoria del sistema
+        memory = psutil.virtual_memory()
+        logger.info(f"Memoria total: {memory.total / 1024**3:.2f} GB")
+        logger.info(f"Memoria disponible: {memory.available / 1024**3:.2f} GB")
+        
+    except Exception as e:
+        logger.error(f"Error durante la inicialización: {e}")
+        raise
+    
     yield
     
-    # Limpieza al cierre
     logger.info("Cerrando recursos y conexiones")
-    # Aquí se podrían cerrar pools de conexiones, etc.
+    # Limpiar cachés
+    get_embeddings.cache_clear()
+    get_vectorstore.cache_clear()
+    get_retriever.cache_clear()
+    get_qa_chain.cache_clear()
+    get_llm.cache_clear()
 
-# MODIFICADO: Mejor manejo de errores en la carga de configuración
-def load_settings() -> Settings:
-    """Carga la configuración con manejo de errores mejorado"""
-    try:
-        settings = Settings()
-        return settings
-    except Exception as e:
-        logger.critical(f"Error crítico al cargar configuración: {e}")
-        msg = f"Fallo en la configuración. Verifica las variables de entorno: {str(e)}"
-        raise RuntimeError(msg)
+# MODIFICADO: Middleware mejorado con métricas y seguridad
+class MetricsMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        self.request_count = 0
+        self.error_count = 0
+        self.total_response_time = 0
+        self.start_time = time.time()
+        
+    async def dispatch(self, request: Request, call_next):
+        self.request_count += 1
+        start_time = time.time()
+        
+        try:
+            # Validar headers de seguridad
+            if request.headers.get("X-Forwarded-For"):
+                logger.warning(f"Request con X-Forwarded-For: {request.headers['X-Forwarded-For']}")
+            
+            # Procesar request
+            response = await call_next(request)
+            
+            # Calcular métricas
+            duration = time.time() - start_time
+            self.total_response_time += duration
+            
+            # Logging mejorado
+            logger.info(
+                f"Request: {request.method} {request.url.path} | "
+                f"Status: {response.status_code} | "
+                f"Duration: {duration:.4f}s | "
+                f"Client: {request.client.host if request.client else 'Unknown'}"
+            )
+            
+            return response
+            
+        except Exception as e:
+            self.error_count += 1
+            duration = time.time() - start_time
+            
+            logger.error(
+                f"Error en request: {request.method} {request.url.path} | "
+                f"Error: {str(e)} | "
+                f"Duration: {duration:.4f}s | "
+                f"Client: {request.client.host if request.client else 'Unknown'}"
+            )
+            
+            if isinstance(e, HTTPException):
+                raise e
+                
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Error interno del servidor"}
+            )
 
+# MODIFICADO: Rate limiter mejorado
+class RateLimiter:
+    def __init__(self, requests_per_minute: int = 60):
+        self.requests_per_minute = requests_per_minute
+        self.requests = defaultdict(list)
+        self.lock = asyncio.Lock()
+        
+    async def check_rate_limit(self, request: Request):
+        async with self.lock:
+            client_id = request.headers.get("X-API-Key") or request.client.host
+            now = time.time()
+            
+            # Limpiar requests antiguos
+            self.requests[client_id] = [
+                req_time for req_time in self.requests[client_id]
+                if now - req_time < 60
+            ]
+            
+            # Verificar límite
+            if len(self.requests[client_id]) >= self.requests_per_minute:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Demasiadas peticiones. Por favor, intente más tarde."
+                )
+            
+            # Registrar nueva request
+            self.requests[client_id].append(now)
+            return True
+
+# MODIFICADO: Inicialización de la aplicación
 try:
-    settings = load_settings()
+    settings = Settings()
 except Exception as e:
-    logger.critical(f"No se pudo cargar la configuración. La aplicación no iniciará: {e}")
+    logger.critical(f"Error al cargar configuración: {e}")
     raise
 
-# MODIFICADO: Creación de la aplicación con lifespan
 app = FastAPI(
     title="RAG API",
     description="API para consultas RAG sobre documentación técnica",
@@ -118,7 +343,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# MODIFICADO: Agregar middleware CORS configurado desde settings
+# MODIFICADO: Middleware y seguridad
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -127,183 +352,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───── Middlewares y seguridad ─────
-# MODIFICADO: Middleware para métricas y logging
-class MetricsMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        start_time = time.time()
-        
-        # Extraer información de la petición
-        path = request.url.path
-        method = request.method
-        
-        # Procesar la petición
-        try:
-            response = await call_next(request)
-            status_code = response.status_code
-            
-            # Calcular tiempo de respuesta
-            duration = time.time() - start_time
-            
-            # Logear métricas
-            logger.info(
-                f"Request: {method} {path} | Status: {status_code} | "
-                f"Duration: {duration:.4f}s"
-            )
-            
-            return response
-        except Exception as e:
-            # Logear excepciones no manejadas
-            logger.error(f"Error no manejado: {method} {path} | Error: {str(e)}")
-            duration = time.time() - start_time
-            logger.info(f"Request failed: {method} {path} | Duration: {duration:.4f}s")
-            
-            # Devolver error 500
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Error interno del servidor"}
-            )
-
-# Añadir middleware de métricas
 app.add_middleware(MetricsMiddleware)
 
-async def verify_api_key_if_configured(request: Request):
-    """Verifica la API key solo si está configurada en settings"""
-    if not settings.api_key:
-        # Si no hay API key configurada, permitir el acceso
-        return True
-        
-    api_key = request.headers.get("X-API-Key")
-    if not api_key or api_key != settings.api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="API Key inválida"
-        )
-    return True
-
-# MODIFICADO: Límite de tasa con memoria en caché
-class RateLimiter:
-    def __init__(self, requests_per_minute: int = 60):
-        self.requests_per_minute = requests_per_minute
-        self.request_history = defaultdict(list)
-        
-    async def check_rate_limit(self, request: Request):
-        # Obtener cliente IP o API key como identificador
-        client_id = request.headers.get("X-API-Key", request.client.host)
-        
-        # Obtener tiempo actual
-        now = time.time()
-        
-        # Filtrar solicitudes recientes (último minuto)
-        minute_ago = now - 60
-        self.request_history[client_id] = [
-            t for t in self.request_history[client_id] if t > minute_ago
-        ]
-        
-        # Verificar límite
-        if len(self.request_history[client_id]) >= self.requests_per_minute:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Límite de velocidad excedido. Intente nuevamente más tarde."
-            )
-            
-        # Registrar esta solicitud
-        self.request_history[client_id].append(now)
-        return True
-
-# Instanciar limitador de tasa
-rate_limiter = RateLimiter(requests_per_minute=60)
-
-# ───── Modelos de carga perezosa ─────
-@lru_cache(maxsize=1)
-def get_question_rewriter():
-    """Inicializa el modelo de reescritura sólo cuando se necesita"""
-    logger.info("Inicializando modelo de reescritura de consultas")
-    try:
-        return pipeline(
-            "text2text-generation",
-            model="google/flan-t5-small",
-            device_map="cpu",
-            trust_remote_code=False,
-        )
-    except Exception as e:
-        logger.error(f"Error al inicializar modelo de reescritura: {e}")
-        # Crear una función fallback que simplemente devuelve la entrada
-        def fallback_rewriter(text):
-            return [{"generated_text": text}]
-        return fallback_rewriter
-
+# MODIFICADO: Inicialización de componentes con mejor manejo de errores
 @lru_cache(maxsize=1)
 def get_embeddings():
-    """Inicializa y retorna el modelo de embeddings"""
+    """Inicializa y retorna el modelo de embeddings con mejor manejo de errores"""
     logger.info("Inicializando modelo de embeddings")
     try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_kwargs = {
+            "device": device
+        }
+        encode_kwargs = {
+            "normalize_embeddings": True,
+            "batch_size": settings.batch_size
+        }
+        
         return HuggingFaceEmbeddings(
             model_name=settings.embedding_model,
-            model_kwargs={"device": "cpu"},
+            model_kwargs=model_kwargs,
+            encode_kwargs=encode_kwargs
         )
     except Exception as e:
         logger.error(f"Error al inicializar embeddings: {e}")
         raise RuntimeError(f"No se pudo inicializar el modelo de embeddings: {e}")
 
-def get_llm():
-    """
-    Función de compatibilidad para mantener código existente.
-    Proporciona acceso síncrono al LLM desde el caché.
-    """
-    import asyncio
-    
-    # Crear un nuevo evento loop si es necesario
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    # Ejecutar la función asíncrona y obtener el resultado
-    try:
-        return loop.run_until_complete(llm_cache.get_llm())
-    except Exception as e:
-        logger.error(f"Error al obtener LLM de forma síncrona: {e}")
-        raise RuntimeError(f"No se pudo inicializar el modelo LLM: {e}")
-
-# Replace lines 242-248 with this code:
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    reraise=True,
-    before=lambda retry_state: logger.warning(
-        f"Reintentando conexión a PGVector (intento {retry_state.attempt_number}/3)..."
-    )
-)
 @lru_cache(maxsize=1)
 def get_vectorstore():
-    """Inicializa y retorna el almacén vectorial con reintentos"""
-    logger.info("Inicializando conexión a PGVector")
-    try:
-        return PGVector(
-            embedding_function=get_embeddings(),
-            collection_name=settings.collection_name,
-            connection_string=settings.pg_conn,
-        )
-    except Exception as e:
-        logger.error(f"Error al conectar con PGVector: {e}")
-        raise RuntimeError(f"No se pudo inicializar la base de datos vectorial: {e}")
+    """Inicializa el vectorstore con reintentos y validación"""
+    @retry(
+        stop=stop_after_attempt(settings.max_retries),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True
+    )
+    def _init_vectorstore():
+        try:
+            # Ignorar warnings de deprecación por ahora ya que seguimos usando la versión community
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning)
+                warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+                
+                return PGVector(
+                    embedding_function=get_embeddings(),
+                    collection_name=settings.collection_name,
+                    connection_string=settings.pg_conn
+                )
+        except Exception as e:
+            logger.error(f"Error al inicializar vectorstore: {e}")
+            raise
+            
+    return _init_vectorstore()
 
 @lru_cache(maxsize=1)
 def get_retriever():
-    """Inicializa el retriever cuando se necesita"""
-    logger.info("Inicializando retriever")
+    """Inicializa el retriever optimizado con procesamiento por lotes"""
+    logger.info("Inicializando retriever con optimización de lotes")
     try:
         vectorstore = get_vectorstore()
-        
         base_retriever = vectorstore.as_retriever(
-            search_kwargs={"k": settings.initial_retrieval_k}
+            search_type="similarity",
+            search_kwargs={
+                "k": settings.initial_retrieval_k,
+                "filter": {},
+                "batch_size": settings.batch_size
+            }
         )
         
+        # Optimización del reranker
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         cross_enc = HuggingFaceCrossEncoder(
             model_name=settings.reranker_model,
-            model_kwargs={"device": "cpu"}
+            model_kwargs={"device": device}
         )
         reranker = CrossEncoderReranker(
             model=cross_enc, 
@@ -315,355 +435,10 @@ def get_retriever():
             base_retriever=base_retriever,
         )
     except Exception as e:
-        logger.error(f"Error al inicializar retriever: {e}", exc_info=True)
+        logger.error(f"Error al inicializar retriever: {e}")
         raise RuntimeError(f"No se pudo inicializar el retriever: {e}")
 
-# MODIFICADO: Sistema de prompts mejor estructurado
-def get_qa_prompt():
-    """Devuelve el prompt para el sistema QA"""
-    return PromptTemplate(
-        template="""
-Eres un asistente especializado en responder preguntas basándote en la información proporcionada.
-
-CONTEXTO:
-{context}
-
-PREGUNTA:
-{question}
-
-Instrucciones:
-1. Responde de manera completa y detallada usando SOLO la información del CONTEXTO.
-2. Si el CONTEXTO contiene toda la información necesaria, proporciona una respuesta completa.
-3. Si el CONTEXTO contiene información parcial, proporciona la parte que puedas responder e indica qué aspectos no están cubiertos.
-4. Si el CONTEXTO no contiene información relevante, responde: "La información solicitada no se encuentra en este manual."
-5. No inventes información ni uses conocimiento externo.
-6. Formatea la respuesta de manera legible usando Markdown cuando sea apropiado.
-
-RESPUESTA:
-""",
-        input_variables=["context", "question"],
-    )
-
-@lru_cache(maxsize=1)
-def get_qa_chain():
-    """Inicializa la cadena QA con el prompt mejorado"""
-    return RetrievalQA.from_chain_type(
-        llm=get_llm(),
-        retriever=get_retriever(),
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": get_qa_prompt()},
-        return_source_documents=True,
-    )
-
-@lru_cache(maxsize=1)
-def get_document_language_stats():
-    """
-    Analiza y devuelve estadísticas sobre los idiomas de los documentos en la base de datos.
-    Cachea los resultados para evitar consultas repetidas.
-    """
-    logger.info("Analizando estadísticas de idiomas en la base de datos...")
-    try:
-        # MODIFICADO: Usar conexión directa a Postgres en lugar de PGVector
-        conn = psycopg2.connect(settings.pg_conn)
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT metadata->>'language' as lang, COUNT(*) as count
-                FROM langchain_pg_embedding
-                WHERE collection_name = %s AND metadata->>'language' IS NOT NULL
-                GROUP BY metadata->>'language'
-                ORDER BY count DESC
-            """, (settings.collection_name,))
-            
-            results = cursor.fetchall()
-        conn.close()
-        
-        # Organizar resultados
-        lang_stats = {}
-        for lang, count in results:
-            lang_stats[lang] = count
-            
-        logger.info(f"Estadísticas de idiomas: {lang_stats}")
-        return lang_stats
-        
-    except Exception as e:
-        logger.error(f"Error al obtener estadísticas de idiomas: {e}")
-        return {}  # En caso de error, devolver diccionario vacío
-
-# MODIFICADO: Función más robusta para fusionar documentos
-def merge_document_info(documents: List[Document]) -> List[Document]:
-    """
-    Fusiona la información de múltiples documentos para proporcionar un contexto
-    más coherente al LLM. Agrupa chunks del mismo documento.
-    """
-    if not documents:
-        return []
-        
-    # MODIFICADO: Validación defensiva de entrada
-    valid_docs = [doc for doc in documents if isinstance(doc, Document)]
-    if len(valid_docs) != len(documents):
-        logger.warning(f"Se descartaron {len(documents) - len(valid_docs)} documentos inválidos")
-    
-    # Agrupar por fuente/documento original
-    docs_by_source = {}
-    for doc in valid_docs:
-        source = doc.metadata.get("source", "unknown")
-        if source not in docs_by_source:
-            docs_by_source[source] = []
-        docs_by_source[source].append(doc)
-    
-    # Para cada fuente, ordenar chunks y fusionar si son consecutivos
-    merged_docs = []
-    for source, chunks in docs_by_source.items():
-        # Intentar ordenar por número de página si existe
-        try:
-            chunks.sort(key=lambda x: x.metadata.get("page", 0))
-            # MODIFICADO: Ordenar también por chunk_id para asegurar orden correcto
-            chunks.sort(key=lambda x: x.metadata.get("chunk_id", 0))
-        except Exception as e:
-            logger.warning(f"Error al ordenar chunks para {source}: {e}")
-        
-        if not chunks:
-            continue
-            
-        current_content = chunks[0].page_content
-        current_meta = chunks[0].metadata.copy()
-        
-        for i in range(1, len(chunks)):
-            # Si los chunks parecen ser consecutivos, fusionar
-            if is_consecutive(chunks[i-1], chunks[i]):
-                current_content += "\n\n" + chunks[i].page_content
-                # Actualizar metadatos como rango de páginas
-                if "page" in chunks[i].metadata and "page" in current_meta:
-                    current_meta["page_range"] = f"{current_meta.get('page', 0)}-{chunks[i].metadata['page']}"
-            else:
-                # Si no son consecutivos, guardar el actual y empezar uno nuevo
-                merged_docs.append(Document(page_content=current_content, metadata=current_meta))
-                current_content = chunks[i].page_content
-                current_meta = chunks[i].metadata.copy()
-        
-        # No olvidar el último documento
-        merged_docs.append(Document(page_content=current_content, metadata=current_meta))
-    
-    return merged_docs
-
-def is_consecutive(doc1: Optional[Document], doc2: Optional[Document]) -> bool:
-    """Determina si dos documentos son consecutivos basándose en metadatos"""
-    if not doc1 or not doc2:  # Validación defensiva
-        return False
-        
-    # Si son del mismo archivo y tienen información de página
-    if doc1.metadata.get("source") == doc2.metadata.get("source"):
-        # Si tienen páginas especificadas, verificar si son consecutivas
-        if "page" in doc1.metadata and "page" in doc2.metadata:
-            try:
-                return doc2.metadata["page"] - doc1.metadata["page"] <= 1
-            except (TypeError, ValueError):
-                pass  # Seguir con otras comprobaciones si falla la conversión numérica
-        
-        # Si tienen posición en el texto (chunk_id), verificar si son consecutivos
-        if "chunk_id" in doc1.metadata and "chunk_id" in doc2.metadata:
-            try:
-                return doc2.metadata["chunk_id"] - doc1.metadata["chunk_id"] == 1
-            except (TypeError, ValueError):
-                pass
-            
-    # Si no hay metadatos útiles, usar el enfoque basado en contenido solo como fallback
-    return False
-
-# MODIFICADO: Sistema de caché mejorado con expiración y manejo avanzado
-class LLMCache:
-    """Gestiona el caché del LLM con expiración controlada"""
-    
-    def __init__(self, ttl_hours: int = 6):
-        self._cache = {}
-        self._timestamps = {}
-        self._ttl = timedelta(hours=ttl_hours)
-        self._lock = asyncio.Lock()
-    
-    async def get_llm(self):
-        """Obtiene el LLM del caché o crea uno nuevo si expiró"""
-        cache_key = "llm"
-        now = datetime.now()
-    
-        async with self._lock:
-            # Verificar caché
-            if (cache_key in self._timestamps and 
-                now - self._timestamps[cache_key] <= self._ttl and
-                cache_key in self._cache):
-                return self._cache[cache_key]
-        
-        # Crear nuevo LLM
-            try:
-            # CORREGIDO: Configurar la API key correctamente
-            # La API key debe configurarse según la documentación de langchain_deepseek
-                llm = ChatDeepSeek(
-                    model=settings.llm_model,
-                    api_key=settings.deepseek_api_key  # Usar api_key directamente en lugar de model_kwargs
-                )
-                self._cache[cache_key] = llm
-                self._timestamps[cache_key] = now
-                return llm
-            except Exception as e:
-                logger.error(f"Error al inicializar LLM: {e}")
-                raise RuntimeError(f"No se pudo inicializar el modelo LLM: {e}")
-    
-    def invalidate(self):
-        """Invalida explícitamente el caché"""
-        self._cache.clear()
-        self._timestamps.clear()
-
-# Instanciar el caché de LLM
-llm_cache = LLMCache(ttl_hours=settings.cache_ttl_hours)
-
-# MODIFICADO: Función verificadora de respuestas mejorada con timeout
-async def verify_answer_quality(question: str, answer: str, context_docs: List[Document]) -> Dict[str, Any]:
-    """
-    Verifica la calidad de la respuesta producida por el LLM,
-    identificando si es completa o parcial respecto al contexto.
-    Incluye manejo de timeouts y mecanismos más estrictos contra alucinaciones.
-    """
-    try:
-        # Obtener LLM con caché
-        llm = await llm_cache.get_llm()
-        
-        # Extraer el contexto relevante
-        context = "\n\n".join([doc.page_content for doc in context_docs])
-        
-        # 1. Primero, verificar si la respuesta contiene información que NO está en el contexto (alucinación)
-        hallucination_check_prompt = f"""
-Analiza si la siguiente respuesta contiene información que NO está presente en el contexto proporcionado.
-
-PREGUNTA: {question}
-
-RESPUESTA GENERADA: {answer}
-
-CONTEXTO DISPONIBLE: {context}
-
-INSTRUCCIONES:
-1. Identifica CUALQUIER fragmento de información en la respuesta que no esté explícitamente mencionado en el contexto.
-2. Para cada fragmento identificado, indica por qué consideras que es una alucinación.
-3. Finalmente, determina:
-   a) Si la respuesta contiene SOLO información presente en el contexto (respuesta = "SIN ALUCINACIONES")
-   b) Si la respuesta contiene información no presente en el contexto (respuesta = "CONTIENE ALUCINACIONES")
-"""
-
-        # Ejecutar verificación con timeout
-        try:
-            hallucination_check = await asyncio.wait_for(
-                asyncio.to_thread(lambda: llm.invoke(hallucination_check_prompt).content),
-                timeout=10.0  # 10 segundos de timeout
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout en verificación de alucinaciones")
-            hallucination_check = "Verificación no concluyente por timeout"
-        
-        # Analizar resultado
-        has_hallucination = "CONTIENE ALUCINACIONES" in hallucination_check or "alucinación" in hallucination_check.lower()
-        
-        # 2. Verificar si la respuesta es completa con respecto a la pregunta
-        completeness_check_prompt = f"""
-Evalúa si la siguiente respuesta aborda COMPLETAMENTE la pregunta planteada, considerando el contexto disponible.
-
-PREGUNTA: {question}
-
-RESPUESTA: {answer}
-
-CONTEXTO DISPONIBLE: {context}
-
-INSTRUCCIONES:
-1. Determina si la respuesta aborda todos los aspectos de la pregunta que pueden ser respondidos con el contexto disponible.
-2. Responde "COMPLETA" si la respuesta cubre todos los aspectos que pueden ser respondidos según el contexto.
-3. Responde "PARCIAL" si la respuesta sólo cubre algunos aspectos de la pregunta que pueden responderse con el contexto.
-4. Responde "INSUFICIENTE" si el contexto no contiene la información necesaria para responder la pregunta.
-"""
-
-        # Ejecutar verificación con timeout
-        try:
-            completeness_check = await asyncio.wait_for(
-                asyncio.to_thread(lambda: llm.invoke(completeness_check_prompt).content),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout en verificación de completitud")
-            completeness_check = "PARCIAL (verificación no concluyente por timeout)"
-            
-        # Analizar completitud
-        is_complete = "COMPLETA" in completeness_check
-        is_partial = "PARCIAL" in completeness_check
-        is_insufficient = "INSUFICIENTE" in completeness_check
-        
-        # Determinar calidad general
-        quality_assessment = "alta"
-        if has_hallucination:
-            quality_assessment = "baja"
-        elif is_partial:
-            quality_assessment = "media"
-        elif is_insufficient:
-            quality_assessment = "baja"
-            
-        # MODIFICADO: Mejorar estructura de la información de verificación
-        verification_info = {
-            "quality": quality_assessment,
-            "has_hallucination": has_hallucination,
-            "completeness": "completa" if is_complete else "parcial" if is_partial else "insuficiente",
-            "hallucination_details": hallucination_check if has_hallucination else None,
-            "completeness_details": completeness_check
-        }
-        
-        return verification_info
-        
-    except Exception as e:
-        logger.error(f"Error en verificación de respuesta: {e}")
-        return {
-            "quality": "no_verificada",
-            "error": str(e),
-            "error_type": type(e).__name__
-        }
-
-# ───── Modelos de datos ─────
-class QueryRequest(BaseModel):
-    query: str
-    language: Optional[str] = None
-    max_sources: Optional[int] = Field(None, ge=1, le=10)
-    detailed_feedback: bool = False
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "query": "¿Cómo funciona la recuperación de documentos en este sistema?",
-                "language": "es",
-                "max_sources": 4,
-                "detailed_feedback": True
-            }
-        }
-    )
-    
-    # MODIFICADO: Validador para sanitizar la entrada
-    @validator('query')
-    def sanitize_query(cls, v):
-        if not v or not v.strip():
-            raise ValueError("La consulta no puede estar vacía")
-        # Limitar longitud de la consulta
-        if len(v) > 1000:
-            raise ValueError("La consulta excede el límite de 1000 caracteres")
-        return v.strip()
-    
-
-    @root_validator(pre=True)
-    def infer_language(cls, values):
-        query = values.get('query')
-        language = values.get('language')
-
-        if not language and query:
-            try:
-                detected_lang = detect(query)
-                values['language'] = detected_lang
-            except LangDetectException:
-                values['language'] = 'en'
-
-        return values
-
-
+# MODIFICADO: Modelos Pydantic para la API
 class SourceInfo(BaseModel):
     source: str
     title: Optional[str] = None
@@ -672,80 +447,232 @@ class SourceInfo(BaseModel):
     relevance_score: Optional[float] = None
     content_preview: Optional[str] = None
 
+class QueryRequest(BaseModel):
+    query: str
+    language: Optional[str] = None
+    detailed_feedback: bool = False
+    model_config = ConfigDict(extra="forbid")
+
+    @validator("query")
+    def validate_query(cls, v):
+        if not v.strip():
+            raise ValueError("La consulta no puede estar vacía")
+        if len(v) > 1000:
+            raise ValueError("La consulta es demasiado larga (máximo 1000 caracteres)")
+        return v.strip()
+
 class QueryResponse(BaseModel):
     answer: str
     sources: List[SourceInfo]
     execution_time: float
-    verification: Optional[Dict[str, Any]] = None
     feedback_url: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
 
-# ───── Endpoints ─────
-@app.get("/health")
-async def health_check():
-    """Endpoint para verificar salud del servicio"""
-    try:
-        # Verificar conexión a la base de datos
-        vectorstore = get_vectorstore()
+# MODIFICADO: Funciones de autenticación y rate limiting
+def verify_api_key_if_configured(request: Request) -> bool:
+    """Verifica la API key si está configurada en settings"""
+    if not settings.api_key:
+        return True
         
-        # Verificar disponibilidad del LLM
-        llm = await llm_cache.get_llm()
-        
-        # Si llegamos aquí, todo está bien
-        return {
-            "status": "ok",
-            "database": "connected",
-            "llm": "available",
-            "timestamp": datetime.now().isoformat(),
-            "environment": settings.environment
-        }
-    except Exception as e:
-        logger.error(f"Health check fallido: {e}")
-        return JSONResponse(
-            status_code=HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "error",
-                "message": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
-        )
-
-@app.get("/stats")
-async def get_stats(request: Request):
-    """Devuelve estadísticas básicas del sistema"""
-    try:
-        # Verificar autenticación
-        await verify_api_key_if_configured(request)
-        
-        # Obtener estadísticas de idiomas
-        lang_stats = get_document_language_stats()
-        
-        # MODIFICADO: Obtener también recuento total de documentos
-        conn = psycopg2.connect(settings.pg_conn)
-        total_documents = 0
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT COUNT(*) FROM langchain_pg_embedding 
-                WHERE collection_name = %s
-            """, (settings.collection_name,))
-            total_documents = cursor.fetchone()[0]
-        conn.close()
-        
-        return {
-            "total_documents": total_documents,
-            "language_distribution": lang_stats,
-            "collection_name": settings.collection_name,
-            "embedding_model": settings.embedding_model,
-            "reranker_model": settings.reranker_model
-        }
-    except HTTPException:
-        # Reenviar excepciones HTTP (como 401)
-        raise
-    except Exception as e:
-        logger.error(f"Error al obtener estadísticas: {e}")
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
         raise HTTPException(
-            status_code=500,
-            detail=f"Error al obtener estadísticas: {str(e)}"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key requerida"
         )
+        
+    if api_key != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key inválida"
+        )
+        
+    return True
+
+# MODIFICADO: Inicialización del rate limiter
+rate_limiter = RateLimiter(requests_per_minute=settings.max_concurrent_requests)
+
+# MODIFICADO: Implementación de caché para consultas
+class AsyncQueryCache:
+    def __init__(self, ttl_hours: int = 6):
+        self.cache = {}
+        self.ttl = timedelta(hours=ttl_hours)
+        self._lock = asyncio.Lock()
+
+    async def get(self, query: str) -> Optional[QueryResponse]:
+        """Obtiene una respuesta cacheada si existe y no ha expirado"""
+        async with self._lock:
+            # Normalizar la consulta para mejor matching
+            normalized_query = query.lower().strip()
+            
+            # Limpiar entradas expiradas
+            now = datetime.now()
+            self.cache = {
+                k: v for k, v in self.cache.items()
+                if now - v["timestamp"] < self.ttl
+            }
+            
+            # Buscar coincidencia exacta o similar
+            for cached_query, cache_data in self.cache.items():
+                if (cached_query == normalized_query or 
+                    (len(normalized_query) > 10 and 
+                     self._similarity_score(cached_query, normalized_query) > 0.9)):
+                    return cache_data["response"]
+            
+            return None
+
+    async def set(self, query: str, response: QueryResponse) -> None:
+        """Almacena una respuesta en caché"""
+        async with self._lock:
+            normalized_query = query.lower().strip()
+            self.cache[normalized_query] = {
+                "response": response,
+                "timestamp": datetime.now()
+            }
+            
+            # Mantener el tamaño del caché bajo control
+            if len(self.cache) > 1000:  # Límite arbitrario
+                # Eliminar las entradas más antiguas
+                sorted_items = sorted(
+                    self.cache.items(),
+                    key=lambda x: x[1]["timestamp"]
+                )
+                self.cache = dict(sorted_items[-1000:])
+
+    def _similarity_score(self, query1: str, query2: str) -> float:
+        """Calcula un score de similitud simple entre dos consultas"""
+        # Convertir a conjuntos de palabras
+        words1 = set(query1.split())
+        words2 = set(query2.split())
+        
+        # Calcular coeficiente de Jaccard
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+        
+        return intersection / union if union > 0 else 0.0
+
+# MODIFICADO: Inicialización del caché
+query_cache = AsyncQueryCache(ttl_hours=settings.cache_ttl_hours)
+
+# MODIFICADO: Función sync para reescribir consultas
+def rewrite_query(query: str, llm) -> Optional[str]:
+    """Reescribe la consulta de forma síncrona"""
+    try:
+        rewrite_prompt = PromptTemplate(
+            template=(
+                "Eres un experto en reformular preguntas para recuperación de información. "
+                "Tu objetivo es generar una versión mejorada de la consulta del usuario que maximice "
+                "la posibilidad de recuperar información relevante de documentos técnicos.\n\n"
+                "Aplica estas técnicas:\n"
+                "1. Usa terminología técnica y sinónimos relevantes\n"
+                "2. Expande acrónimos y abreviaturas\n"
+                "3. Incorpora términos relacionados temáticamente\n"
+                "4. Elimina palabras ambiguas o innecesarias\n"
+                "5. Mantén la intención original del usuario\n\n"
+                "PREGUNTA ORIGINAL: \"{user_query}\"\n\n"
+                "PREGUNTA REFORMULADA:"
+            ),
+            input_variables=["user_query"]
+        )
+        rewrite_chain = LLMChain(llm=llm, prompt=rewrite_prompt)
+        
+        rewrite_response = rewrite_chain.invoke({"user_query": query})
+        temp_rewritten_query = rewrite_response.get("text", "").strip()
+        
+        if "PREGUNTA REFORMULADA:" in temp_rewritten_query:
+            temp_rewritten_query = temp_rewritten_query.split("PREGUNTA REFORMULADA:")[-1].strip()
+            
+        if temp_rewritten_query and temp_rewritten_query.lower() != query.lower():
+            return temp_rewritten_query.replace('"', '')
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Error en reescritura de consulta: {e}")
+        return None
+
+# MODIFICADO: Variable global para el traductor
+_translator = None
+
+def get_translator():
+    """Inicializa y retorna el modelo de traducción"""
+    global _translator
+    
+    try:
+        if _translator is None:
+            # Usar MarianMT que usa el tokenizer estándar
+            _translator = pipeline(
+                task="translation",
+                model="Helsinki-NLP/opus-mt-es-en",
+                tokenizer="Helsinki-NLP/opus-mt-es-en",
+                framework="pt"
+            )
+        return _translator
+            
+    except Exception as e:
+        logger.error(f"Error al inicializar traductor: {e}")
+        return None
+
+def translate_query(query: str, source_lang: str, target_lang: str) -> str:
+    """Translate the query if needed"""
+    if source_lang == target_lang:
+        return query
+        
+    translated = translate_text(query, source_lang, target_lang)
+    if translated is None:
+        logger.warning(f"Translation failed, using original query")
+        return query
+        
+    logger.info(f"Query translated from {source_lang} to {target_lang}")
+    return translated
+
+def merge_document_results(original_docs: List[Document], translated_docs: List[Document]) -> List[Document]:
+    """Merge and deduplicate documents from both queries, prioritizing higher relevance scores"""
+    if not original_docs:
+        return translated_docs
+    if not translated_docs:
+        return original_docs
+        
+    # Create a dictionary to store unique documents by content
+    unique_docs = {}
+    
+    # Process original documents
+    for doc in original_docs:
+        content_hash = hash(doc.page_content)
+        if content_hash not in unique_docs:
+            unique_docs[content_hash] = doc
+        else:
+            # If document exists, keep the one with higher relevance score
+            existing_score = unique_docs[content_hash].metadata.get("relevance_score", 0)
+            new_score = doc.metadata.get("relevance_score", 0)
+            if new_score > existing_score:
+                unique_docs[content_hash] = doc
+    
+    # Process translated documents
+    for doc in translated_docs:
+        content_hash = hash(doc.page_content)
+        if content_hash not in unique_docs:
+            unique_docs[content_hash] = doc
+        else:
+            # If document exists, keep the one with higher relevance score
+            existing_score = unique_docs[content_hash].metadata.get("relevance_score", 0)
+            new_score = doc.metadata.get("relevance_score", 0)
+            if new_score > existing_score:
+                unique_docs[content_hash] = doc
+    
+    # Convert back to list and sort by relevance score
+    merged_docs = list(unique_docs.values())
+    merged_docs.sort(key=lambda x: x.metadata.get("relevance_score", 0), reverse=True)
+    
+    return merged_docs
+
+async def perform_retrieval_with_timeout(retriever, query: str, timeout: int) -> List[Document]:
+    """Perform document retrieval with timeout"""
+    try:
+        async with async_timeout.timeout(timeout):
+            return await asyncio.to_thread(lambda: retriever.invoke(query))
+    except asyncio.TimeoutError:
+        logger.warning(f"Retrieval timeout for query: {query[:100]}...")
+        return []
 
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(
@@ -755,449 +682,206 @@ async def query_documents(
     api_auth: bool = Depends(verify_api_key_if_configured),
     rate_limit: bool = Depends(rate_limiter.check_rate_limit)
 ):
-    """Procesa una consulta y devuelve la respuesta del
-    modelo de lenguaje y los documentos relevantes"""
     start_time = time.time()
     
-    # MODIFICADO: Validar que la consulta no esté vacía antes de procesar
-    if not request_data.query or not request_data.query.strip():
-        raise HTTPException(status_code=400, detail="La consulta no puede estar vacía")
-    
     try:
-        # MODIFICADO: Registro estructurado y seguro de la consulta (sin datos sensibles)
+        # Validación de entrada
+        if not request_data.query.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="La consulta no puede estar vacía"
+            )
+            
+        # Generar ID único para la consulta
+        query_id = f"q-{int(time.time())}-{hashlib.md5(request_data.query.encode()).hexdigest()[:6]}"
+        
+        # Registrar la consulta
         query_log = {
-            "query_id": f"q-{int(time.time())}",
+            "query_id": query_id,
             "timestamp": datetime.now().isoformat(),
             "query_length": len(request_data.query),
             "detected_language": request_data.language,
-            "client_ip": request.client.host if request.client else "unknown"
+            "client_ip": request.client.host if request.client else "unknown",
+            "detailed_feedback_requested": request_data.detailed_feedback
         }
-        logger.info(f"Nueva consulta: {json.dumps(query_log)}")
+        logger.info(f"Nueva consulta recibida: {json.dumps(query_log)}")
         
-        # MODIFICADO: Reescritura opcional de la consulta para mejorar recuperación
-        query = request_data.query
-        try:
-            # Obtener modelo de reescritura
-            rewriter = get_question_rewriter()
+        # Verificar caché antes de procesar
+        cached_response = await query_cache.get(request_data.query)
+        if cached_response:
+            logger.info(f"Respuesta obtenida de caché para query similar a: '{request_data.query}'")
+            cached_response.execution_time = round(time.time() - start_time, 4)
+            return cached_response
             
-            # Generar prompt para reescritura
-            rewrite_prompt = f"Reescribe esta pregunta para optimizar la recuperación de información relevante: {query}"
-            
-            # Ejecutar reescritura con timeout
-            rewritten_result = await asyncio.wait_for(
-                asyncio.to_thread(lambda: rewriter(rewrite_prompt)[0]["generated_text"]),
-                timeout=3.0  # Timeout de 3 segundos para no retrasar mucho
+        # Procesar consulta con timeout
+        async with async_timeout.timeout(settings.query_timeout):
+            # Reescritura de consulta si está habilitada
+            original_query = request_data.query
+            rewritten_query = None
+
+            if settings.query_rewrite_strategy != "original_only":
+                llm = get_llm()
+                rewritten_query = rewrite_query(original_query, llm)
+                if rewritten_query:
+                    logger.info(f"Consulta reescrita: '{rewritten_query}'")
+
+            # Determinar query a usar según estrategia
+            if settings.query_rewrite_strategy == "original_only":
+                query_to_use = original_query
+            elif settings.query_rewrite_strategy == "rewrite_only":
+                query_to_use = rewritten_query if rewritten_query else original_query
+            else:  # concatenate
+                query_to_use = f"{original_query} | {rewritten_query}" if rewritten_query else original_query
+                
+            # Recuperar documentos usando el nuevo método invoke
+            retriever = get_retriever()
+            raw_source_docs = await perform_retrieval_with_timeout(
+                retriever, 
+                query_to_use,
+                settings.retrieval_timeout
             )
             
-            # Solo usar si la reescritura no está vacía y es diferente
-            if rewritten_result and rewritten_result.strip() and rewritten_result != query:
-                logger.debug(f"Consulta reescrita: {rewritten_result}")
-                # Usar la consulta original y la reescrita
-                query = f"{query} {rewritten_result}"
-        except (asyncio.TimeoutError, Exception) as e:
-            # Si hay error en reescritura, seguir con consulta original
-            logger.warning(f"Error en reescritura de consulta: {str(e)}")
-        
-        # Obtener documentos relevantes
-        try:
-            # MODIFICADO: Optimización de la cadena QA para mejor rendimiento
-            chain = get_qa_chain()
+            if not raw_source_docs:
+                logger.warning("No se encontraron documentos relevantes")
+                return QueryResponse(
+                    answer="No se encontró información relevante en los documentos para responder a su pregunta.",
+                    sources=[],
+                    execution_time=round(time.time() - start_time, 4)
+                )
+                
+            # Detect document language and handle translation
+            original_docs = []
+            translated_docs = []
             
-            # Ejecutar la consulta con manejo de errores
-            result = chain({"query": query})
+            if raw_source_docs:
+                try:
+                    doc_language = detect_document_language(raw_source_docs)
+                    query_language = request_data.language or detect(query_to_use)
+                    
+                    if doc_language != query_language:
+                        logger.info(f"Document in {doc_language}, query in {query_language}")
+                        
+                        # Get results for original query with timeout
+                        original_docs = await perform_retrieval_with_timeout(
+                            retriever, 
+                            query_to_use,
+                            settings.retrieval_timeout
+                        )
+                        
+                        if doc_language == "en" and query_language == "es":
+                            # Translate with timeout
+                            try:
+                                async with async_timeout.timeout(settings.translation_timeout):
+                                    translated_query = translate_query(query_to_use, "es", "en")
+                            except asyncio.TimeoutError:
+                                logger.warning("Translation timeout, using original query")
+                                translated_query = query_to_use
+                                
+                            if translated_query and translated_query != query_to_use:
+                                # Get results for translated query with timeout
+                                translated_docs = await perform_retrieval_with_timeout(
+                                    retriever,
+                                    translated_query,
+                                    settings.retrieval_timeout
+                                )
+                                logger.info(f"Retrieved {len(translated_docs)} documents from translated query")
+                        
+                        # Merge results from both queries
+                        raw_source_docs = merge_document_results(original_docs, translated_docs)
+                        logger.info(f"After merging: {len(raw_source_docs)} unique documents")
+                        
+                except Exception as e:
+                    logger.warning(f"Error in translation process: {e}, using original query results")
+                    raw_source_docs = original_docs if original_docs else raw_source_docs
+
+            # Fusionar documentos consecutivos
+            merged_docs = merge_document_info(raw_source_docs)
             
-            # Extraer respuesta y documentos fuente
-            answer = result.get("result", "")
-            raw_source_docs = result.get("source_documents", [])
+            # Generar respuesta de forma síncrona
+            context = "\n\n".join([doc.page_content for doc in merged_docs])
+            llm = get_llm()
+            qa_chain = get_qa_chain()
             
-            # MODIFICADO: Mejorar procesamiento de fuentes con merge_document_info
-            source_docs = merge_document_info(raw_source_docs)
-            
-            # Limitar número de fuentes si se especifica
-            max_sources = request_data.max_sources or settings.final_docs_count
-            source_docs = source_docs[:max_sources]
-            
-            # MODIFICADO: Formatear información de fuentes con vistas previas
+            try:
+                async with async_timeout.timeout(settings.query_timeout - (time.time() - start_time)):
+                    result = await asyncio.to_thread(
+                        qa_chain.invoke,
+                        {"context": context, "question": original_query}
+                    )
+            except asyncio.TimeoutError:
+                logger.warning("QA chain timeout, returning partial results")
+                result = {"text": "The query took too long to process. Please try rephrasing or breaking it into smaller parts."}
+
+            # Preparar fuentes
             sources_info = []
-            for i, doc in enumerate(source_docs):
-                # Extraer metadatos relevantes con manejo defensivo
+            for doc in merged_docs:
                 metadata = doc.metadata or {}
-                
-                # Crear vista previa del contenido (primeros 150 caracteres)
-                content_preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                
-                # Añadir información de fuente formateada
+                content_preview = None
+                if request_data.detailed_feedback:
+                    content_preview = (
+                        doc.page_content[:150] + "..." 
+                        if len(doc.page_content) > 150 
+                        else doc.page_content
+                    )
+                    
                 sources_info.append(SourceInfo(
-                    source=metadata.get("source", f"source-{i}"),
+                    source=metadata.get("source", "unknown"),
                     title=metadata.get("title"),
                     page=metadata.get("page"),
                     page_range=metadata.get("page_range"),
-                    relevance_score=metadata.get("score"),
-                    content_preview=content_preview if request_data.detailed_feedback else None
+                    relevance_score=metadata.get("relevance_score"),
+                    content_preview=content_preview
                 ))
-            
-            # MODIFICADO: Verificación opcional de calidad de respuesta
-            verification_info = None
-            if request_data.detailed_feedback:
-                verification_info = await verify_answer_quality(
-                    question=request_data.query,
-                    answer=answer,
-                    context_docs=source_docs
-                )
-            
-            # Calcular tiempo de ejecución
-            execution_time = time.time() - start_time
-            
-            # MODIFICADO: Añadir enlace opcional de feedback si está configurado
+                
+            # Generar URL de feedback si está configurada
             feedback_url = None
             if os.environ.get("FEEDBACK_URL"):
-                feedback_id = hashlib.md5(f"{request_data.query}-{int(time.time())}".encode()).hexdigest()[:10]
-                feedback_url = f"{os.environ.get('FEEDBACK_URL')}?id={feedback_id}"
-            
-            # MODIFICADO: Registro de telemetría en background para no bloquear respuesta
+                feedback_id = hashlib.md5(
+                    f"{original_query}-{int(time.time())}".encode()
+                ).hexdigest()[:10]
+                feedback_url = f"{os.environ['FEEDBACK_URL']}?id={feedback_id}&query={original_query[:50]}"
+                
+            # Registrar métricas en background
             background_tasks.add_task(
                 log_query_metrics,
-                query=request_data.query,
+                query=original_query,
                 num_sources=len(sources_info),
-                execution_time=execution_time,
-                language=request_data.language,
-                quality=verification_info.get("quality", "no_verificada") if verification_info else "no_verificada"
+                execution_time=time.time() - start_time,
+                language=request_data.language
             )
             
-            # Devolver respuesta formateada
-            return QueryResponse(
-                answer=answer,
+            # Crear respuesta
+            response = QueryResponse(
+                answer=result.get("text", "No se pudo generar una respuesta."),
                 sources=sources_info,
-                execution_time=execution_time,
-                verification=verification_info,
+                execution_time=round(time.time() - start_time, 4),
                 feedback_url=feedback_url
             )
             
-        except Exception as e:
-            # Capturar errores específicos de la cadena
-            logger.error(f"Error en procesamiento de consulta: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error al procesar la consulta: {str(e)}"
-            )
-    
-    except HTTPException:
-        # Re-lanzar excepciones HTTP
-        raise
+            # Almacenar en caché
+            await query_cache.set(original_query, response)
+            
+            return response
+            
+    except asyncio.TimeoutError:
+        logger.error(f"Overall query timeout: {request_data.query}")
+        raise HTTPException(
+            status_code=504,
+            detail="The query exceeded the maximum processing time. Please try rephrasing or breaking it into smaller parts."
+        )
     except Exception as e:
-        # Capturar cualquier otro error
-        logger.error(f"Error general en endpoint /query: {e}", exc_info=True)
-        traceback_str = traceback.format_exc()
-        logger.debug(f"Traceback: {traceback_str}")
-        
+        logger.error(f"Error in query: {e}")
         raise HTTPException(
             status_code=500,
-            detail="Error interno del servidor al procesar la consulta."
+            detail="Internal server error"
         )
 
-# MODIFICADO: Función para registro de métricas sin bloquear respuesta
-async def log_query_metrics(
-    query: str,
-    num_sources: int,
-    execution_time: float,
-    language: str,
-    quality: str
-):
-    """Registra métricas de la consulta de forma asíncrona"""
-    try:
-        # Aquí se podría enviar datos a un sistema de análisis
-        # Como Prometheus, InfluxDB, etc.
-        metrics = {
-            "timestamp": datetime.now().isoformat(),
-            "query_length": len(query),
-            "num_sources": num_sources,
-            "execution_time": execution_time,
-            "language": language,
-            "quality": quality
-        }
-        
-        logger.info(f"Metrics: {json.dumps(metrics)}")
-        
-        # Si hay una base de datos para métricas configurada, guardar
-        if os.environ.get("METRICS_DB"):
-            # Aquí iría código para guardar en BD de métricas
-            pass
-            
-    except Exception as e:
-        logger.error(f"Error al registrar métricas: {e}")
-        # No re-lanzar excepción para no afectar al flujo principal
-
-# MODIFICADO: Endpoint para búsqueda directa en vectorstore
-@app.post("/search")
-async def search_documents(
-    request: Request,
-    query: str = None,
-    k: int = 5,
-    api_auth: bool = Depends(verify_api_key_if_configured),
-    rate_limit: bool = Depends(rate_limiter.check_rate_limit)
-):
-    """Endpoint para búsqueda directa sin procesamiento LLM"""
-    if not query or not query.strip():
-        raise HTTPException(status_code=400, detail="La consulta no puede estar vacía")
-    
-    try:
-        # Obtener vectorstore
-        vectorstore = get_vectorstore()
-        
-        # Realizar búsqueda directa
-        results = vectorstore.similarity_search_with_score(query, k=k)
-        
-        # Formatear resultados
-        formatted_results = []
-        for doc, score in results:
-            # Extraer metadatos relevantes
-            metadata = doc.metadata or {}
-            
-            # Normalizar score (0-1 donde 1 es mejor)
-            normalized_score = float(score) if isinstance(score, (int, float)) else 0.0
-            
-            # Crear vista previa del contenido
-            content_preview = doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
-            
-            # Añadir resultado formateado
-            formatted_results.append({
-                "content": content_preview,
-                "source": metadata.get("source", "unknown"),
-                "page": metadata.get("page"),
-                "score": normalized_score,
-                "language": metadata.get("language", "unknown")
-            })
-        
-        return {
-            "results": formatted_results,
-            "count": len(formatted_results),
-            "query": query
-        }
-        
-    except Exception as e:
-        logger.error(f"Error en búsqueda directa: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error al realizar la búsqueda: {str(e)}"
-        )
-
-# MODIFICADO: Endpoint para mantenimiento de caché
-@app.post("/admin/cache/invalidate", status_code=204)
-async def invalidate_cache(
-    request: Request,
-    api_auth: bool = Depends(verify_api_key_if_configured)
-):
-    """Invalida los cachés de la aplicación"""
-    # Verificar que haya una API key configurada para este endpoint sensible
-    if not settings.api_key:
-        raise HTTPException(
-            status_code=403,
-            detail="Este endpoint requiere autenticación con API key"
-        )
-    
-    try:
-        # Invalidar caché LRU
-        get_embeddings.cache_clear()
-        get_vectorstore.cache_clear()
-        get_retriever.cache_clear()
-        get_qa_chain.cache_clear()
-        get_document_language_stats.cache_clear()
-        
-        # Invalidar caché de LLM
-        llm_cache.invalidate()
-        
-        logger.info("Cachés invalidados por solicitud administrativa")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error al invalidar cachés: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error al invalidar cachés: {str(e)}"
-        )
-
-# MODIFICADO: Endpoint para diagnóstico de configuración (solo en dev/staging)
-@app.get("/admin/diagnostics")
-async def get_diagnostics(
-    request: Request,
-    api_auth: bool = Depends(verify_api_key_if_configured)
-):
-    """Devuelve información de diagnóstico para solución de problemas"""
-    # Verificar que no estamos en producción
-    if settings.environment.lower() == "production":
-        raise HTTPException(
-            status_code=403,
-            detail="Este endpoint no está disponible en producción"
-        )
-    
-    # Verificar que haya una API key configurada para este endpoint sensible
-    if not settings.api_key:
-        raise HTTPException(
-            status_code=403,
-            detail="Este endpoint requiere autenticación con API key"
-        )
-    
-    try:
-        # Recopilar información de diagnóstico
-        diagnostics = {
-            "settings": {
-                "embedding_model": settings.embedding_model,
-                "reranker_model": settings.reranker_model,
-                "collection_name": settings.collection_name,
-                "initial_retrieval_k": settings.initial_retrieval_k,
-                "final_docs_count": settings.final_docs_count,
-                "environment": settings.environment,
-                "cache_ttl_hours": settings.cache_ttl_hours
-            },
-            "runtime": {
-                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-                "cpu_count": multiprocessing.cpu_count(),
-                "memory_usage_mb": psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-            },
-            "models_info": {
-                "embedding_model_loaded": get_embeddings.cache_info().hits > 0,
-                "vectorstore_connected": get_vectorstore.cache_info().hits > 0,
-                "retriever_initialized": get_retriever.cache_info().hits > 0
-            }
-        }
-        
-        # Verificar conectividad a BD
-        try:
-            conn = psycopg2.connect(settings.pg_conn)
-            diagnostics["database"] = {
-                "connection": "ok",
-                "backend_pid": conn.get_backend_pid()
-            }
-            conn.close()
-        except Exception as db_error:
-            diagnostics["database"] = {
-                "connection": "error",
-                "error": str(db_error)
-            }
-        
-        return diagnostics
-        
-    except Exception as e:
-        logger.error(f"Error al generar diagnóstico: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error al generar información de diagnóstico: {str(e)}"
-        )
-
-# MODIFICADO: Endpoint para verificar problemas comunes en configuración
-@app.get("/admin/check")
-async def check_configuration(
-    request: Request,
-    api_auth: bool = Depends(verify_api_key_if_configured)
-):
-    """Verifica problemas comunes en la configuración"""
-    # Verificar que haya una API key configurada para este endpoint sensible
-    if not settings.api_key:
-        raise HTTPException(
-            status_code=403,
-            detail="Este endpoint requiere autenticación con API key"
-        )
-    
-    issues = []
-    warnings = []
-    
-    # Verificar variables de entorno críticas
-    if not settings.pg_conn:
-        issues.append("Variable PG_CONN no configurada")
-    
-    if not settings.deepseek_api_key:
-        issues.append("Variable DEEPSEEK_API_KEY no configurada")
-    
-    # Verificar conexión a BD
-    try:
-        conn = psycopg2.connect(settings.pg_conn)
-        with conn.cursor() as cursor:
-            # Verificar si la colección existe
-            cursor.execute("""
-                SELECT COUNT(*) FROM langchain_pg_embedding 
-                WHERE collection_name = %s
-            """, (settings.collection_name,))
-            count = cursor.fetchone()[0]
-            if count == 0:
-                warnings.append(f"La colección '{settings.collection_name}' está vacía")
-        conn.close()
-    except Exception as e:
-        issues.append(f"Error de conexión a base de datos: {str(e)}")
-    
-    # Verificar modelos
-    try:
-        embeddings = get_embeddings()
-    except Exception as e:
-        issues.append(f"Error al inicializar modelo de embeddings: {str(e)}")
-    
-    # Verificar LLM
-    try:
-        llm = await llm_cache.get_llm()
-    except Exception as e:
-        issues.append(f"Error al inicializar LLM: {str(e)}")
-    
-    # Devolver resultados
-    return {
-        "status": "error" if issues else "warning" if warnings else "ok",
-        "issues": issues,
-        "warnings": warnings
-    }
-
-
-# MODIFICADO: Endpoint para obtener documentos por IDs
-@app.get("/documents/{doc_id}")
-async def get_document_by_id(
-    doc_id: str,
-    request: Request,
-    api_auth: bool = Depends(verify_api_key_if_configured)
-):
-    """Obtiene un documento específico por su ID"""
-    try:
-        # Conectar a la base de datos directamente para mayor eficiencia
-        conn = psycopg2.connect(settings.pg_conn)
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT id, document, metadata 
-                FROM langchain_pg_embedding 
-                WHERE collection_name = %s AND id = %s
-            """, (settings.collection_name, doc_id))
-            
-            result = cursor.fetchone()
-            
-        conn.close()
-        
-        if not result:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Documento con ID {doc_id} no encontrado"
-            )
-            
-        doc_id, document, metadata = result
-        
-        return {
-            "id": doc_id,
-            "content": document,
-            "metadata": metadata
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error al obtener documento {doc_id}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error al recuperar documento: {str(e)}"
-        )
-
-# MODIFICADO: Punto de entrada para ejecución directa
+# MODIFICADO: Punto de entrada mejorado
 if __name__ == "__main__":
     import uvicorn
-    import sys
     
-    # Obtener puerto desde argumentos o usar 8000 por defecto
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     
-    # Mostrar información de configuración
     print(f"🚀 Iniciando API RAG en puerto {port}")
     print(f"📄 Colección: {settings.collection_name}")
     print(f"🧠 Modelo de embeddings: {settings.embedding_model}")
@@ -1205,11 +889,39 @@ if __name__ == "__main__":
     print(f"🤖 LLM: {settings.llm_model}")
     print(f"🌍 Entorno: {settings.environment}")
     
-    # Iniciar servidor
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
-        reload=settings.environment.lower() != "production"  # Habilitar recarga en desarrollo
+        reload=settings.environment.lower() != "production",
+        workers=min(multiprocessing.cpu_count(), 4)  # Limitar workers para evitar sobrecarga
     )
+
+def detect_document_language(docs: List[Document]) -> str:
+    """Detecta el idioma predominante en los documentos"""
+    try:
+        # Tomar una muestra de texto de cada documento
+        text_samples = []
+        for doc in docs[:5]:  # Limitar a 5 documentos para eficiencia
+            content = doc.page_content
+            # Tomar los primeros 1000 caracteres de cada documento
+            text_samples.append(content[:1000])
+        
+        # Detectar idioma de cada muestra
+        languages = []
+        for sample in text_samples:
+            try:
+                lang = detect(sample)
+                languages.append(lang)
+            except LangDetectException:
+                continue
+        
+        # Retornar el idioma más común
+        if languages:
+            from collections import Counter
+            return Counter(languages).most_common(1)[0][0]
+        return "en"  # Default a inglés si no se puede detectar
+    except Exception as e:
+        logger.warning(f"Error detectando idioma de documentos: {e}")
+        return "en"
