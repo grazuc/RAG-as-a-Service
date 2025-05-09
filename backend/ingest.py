@@ -934,38 +934,7 @@ def parallel_embed_chunks(chunks: List[Document], embeddings, batch_size: int, w
                 except Exception as e:
                     logger.error(f"Error en recuperación de bloque {block_idx}: {e}")
     
-    return results
-
-
-def parallel_embed_chunks(chunks: List[Document], embeddings, batch_size: int, workers: int) -> List[Tuple[Document, List[float]]]:
-    """
-    Calcula embeddings en paralelo usando múltiples workers
-    Retorna lista de tuplas (documento, embedding)
-    """
-    if not chunks:
-        return []
-    
-    # Dividir en bloques de trabajo para cada worker
-    chunk_blocks = [chunks[i:i + batch_size*2] for i in range(0, len(chunks), batch_size*2)]
-    results = []
-    
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(batch_process_embeddings, block, embeddings, batch_size): i
-            for i, block in enumerate(chunk_blocks)
-        }
-        
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Calculando embeddings"):
-            try:
-                batch_results = future.result()
-                results.extend(batch_results)
-            except Exception as e:
-                logger.error(f"Error en cálculo de embeddings: {e}")
-                
-    return results
-
-
-# En ingest.py
+    return results# En ingest.py
 
 def insert_into_pgvector(
     doc_embed_pairs: List[Tuple[Document, List[float]]], 

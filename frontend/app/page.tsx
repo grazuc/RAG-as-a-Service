@@ -1,230 +1,222 @@
-"use client"
+"use client";
 
-import type React from "react"
-
-import { useState } from "react"
-import { Input } from "@/components/ui/input"
-import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
-import { Loader2, Search, BookOpen, FileText, AlertCircle } from "lucide-react"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-
-interface Source {
-  file: string
-  snippet: string
-}
-
-interface ApiResponse {
-  original_query: string
-  rewritten_query: string
-  answer: string
-  sources: Source[]
-}
+import React, { useState, useRef, useEffect } from "react";
+import { Toaster, toast } from "sonner";
+import ReactMarkdown from "react-markdown";
 
 export default function Home() {
-  const [isLoading, setIsLoading] = useState(false)
-  const [response, setResponse] = useState<ApiResponse | null>(null)
-  const [query, setQuery] = useState("")
-  const [error, setError] = useState<string | null>(null)
+  const [documentUploaded, setDocumentUploaded] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [response, setResponse] = useState<any>(null);
+  const [conversations, setConversations] = useState<any[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [fileName, setFileName] = useState<string>("");
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!query.trim() || isLoading) return
-
-    setIsLoading(true)
-    setError(null)
-
-    try {
-      const res = await fetch("http://localhost:8000/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ query }),
-      })
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}))
-        throw new Error(errorData.detail || `Error ${res.status}: ${res.statusText}`)
-      }
-
-      const data = await res.json()
-      setResponse(data)
-    } catch (error) {
-      console.error("Error:", error)
-      setError(error instanceof Error ? error.message : "Error al conectar con el servidor")
-    } finally {
-      setIsLoading(false)
+  // Cargar conversaciones desde localStorage al subir un archivo
+  useEffect(() => {
+    if (documentUploaded) {
+      const saved = localStorage.getItem("conversations");
+      if (saved) setConversations(JSON.parse(saved));
+      const savedFile = localStorage.getItem("fileName");
+      if (savedFile) setFileName(savedFile);
     }
-  }
+  }, [documentUploaded]);
+
+  // Guardar conversaciones en localStorage cuando cambian
+  useEffect(() => {
+    if (documentUploaded) {
+      localStorage.setItem("conversations", JSON.stringify(conversations));
+    }
+  }, [conversations, documentUploaded]);
+
+  // --- File Upload Logic ---
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!["pdf", "docx", "txt"].includes(file.name.split(".").pop()?.toLowerCase() || "")) {
+      toast.error("Solo se permiten archivos PDF, DOCX o TXT");
+      return;
+    }
+    setUploading(true);
+    setResponse(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("http://localhost:8000/upload", {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || "Error al subir el documento");
+      }
+      toast.success("Documento procesado correctamente");
+      setDocumentUploaded(true);
+      setConversations([]); // Limpiar conversaciones al subir nuevo archivo
+      localStorage.removeItem("conversations");
+      setFileName(file.name); // Guardar nombre del archivo
+      localStorage.setItem("fileName", file.name);
+    } catch (err: any) {
+      toast.error(err.message || "Error al subir el documento");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // --- Query Logic ---
+  const handleQuery = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    setLoading(true);
+    setResponse(null);
+    try {
+      const res = await fetch("http://localhost:8000/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: query.trim() }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || "Error en la consulta");
+      }
+      const data = await res.json();
+      setResponse(data);
+      setConversations(prev => [
+        ...prev,
+        { question: query.trim(), answer: data.answer, sources: data.sources }
+      ]);
+    } catch (err: any) {
+      toast.error(err.message || "Error en la consulta");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Deduplicar fuentes por source y page
+  const dedupedSources = (sources: any[] = []) => {
+    const map = new Map();
+    sources.forEach((src) => {
+      const key = `${src.source}-${src.page ?? ""}`;
+      if (!map.has(key)) {
+        map.set(key, src);
+      }
+    });
+    return Array.from(map.values());
+  };
+
+  function formatAnswer(text: string): string {
+    return text.replace(/\n{2,}/g, '\n\n&nbsp;\n\n'); // truco para romper <p> y simular separación real
+  };
+  
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-blue-50 to-white p-4 md:p-8">
-      <div className="max-w-4xl mx-auto">
-        <div className="flex flex-col items-center justify-center mb-8">
-          <div className="bg-blue-100 p-3 rounded-full mb-4">
-            <BookOpen className="h-8 w-8 text-blue-600" />
+    <main className="min-h-screen bg-background flex flex-row">
+      {/* Sidebar de conversaciones solo si hay documento */}
+      {documentUploaded && (
+        <aside className="w-80 min-h-screen bg-muted/40 border-r border-muted-foreground/20 flex flex-col p-4">
+          <h2 className="text-lg font-bold mb-4">Conversaciones</h2>
+          <div className="flex-1 overflow-y-auto space-y-4">
+            <div className="bg-background rounded-lg p-3 shadow">
+              <div className="font-bold text-primary mb-2">{fileName}</div>
+              {conversations.length > 0 ? (
+                <div className="text-sm text-muted-foreground line-clamp-3">{conversations[conversations.length-1].question}</div>
+              ) : (
+                <div className="text-muted-foreground text-sm">No hay preguntas aún.</div>
+              )}
+            </div>
           </div>
-          <h1 className="text-3xl font-bold text-center mb-2 text-blue-900">Asistente de Consulta Inteligente</h1>
-          <p className="text-gray-600 text-center max-w-md">
-            Realiza preguntas sobre cualquier tema y obtén respuestas precisas con fuentes verificadas
-          </p>
-        </div>
-
-        <div className="bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden">
-          <div className="p-6">
-            <form onSubmit={handleSubmit} className="w-full">
-              <div className="relative">
-                <div className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">
-                  <Search className="h-5 w-5" />
-                </div>
-                <Input
-                  type="text"
-                  placeholder="¿Qué deseas saber? Escribe tu pregunta aquí..."
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  className="pl-10 pr-24 py-6 text-base rounded-full border-gray-200 shadow-sm"
-                  disabled={isLoading}
-                />
-                <div className="absolute right-1.5 top-1/2 -translate-y-1/2">
-                  <Button
-                    type="submit"
-                    disabled={isLoading || !query.trim()}
-                    className="rounded-full px-4 bg-blue-600 hover:bg-blue-700 text-white"
-                  >
-                    {isLoading ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <>
-                        <span className="mr-2">Enviar</span>
-                        <svg
-                          className="h-4 w-4"
-                          xmlns="http://www.w3.org/2000/svg"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <line x1="22" y1="2" x2="11" y2="13"></line>
-                          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-                        </svg>
-                      </>
-                    )}
-                  </Button>
+        </aside>
+      )}
+      {/* Chat principal */}
+      <div className="flex-1 flex flex-col items-center justify-center">
+        <div className="w-full max-w-2xl mx-auto mt-12 p-6 rounded-2xl bg-muted/60 shadow-lg">
+          <h1 className="text-3xl font-bold text-center mb-8">¿En qué puedo ayudarte?</h1>
+          {/* Chat y respuesta */}
+          <form onSubmit={handleQuery} className="flex flex-col gap-4">
+            <textarea
+              className="w-full rounded-lg border border-input bg-background px-4 py-3 text-base shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 min-h-[60px] resize-none"
+              placeholder={documentUploaded ? "Escribe tu pregunta sobre el documento..." : "Sube un archivo para comenzar"}
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              disabled={loading || !documentUploaded}
+            />
+            <div className="flex flex-row justify-between items-center gap-2">
+              <button
+                type="button"
+                className="flex items-center gap-2 px-5 py-2 rounded-full bg-primary text-primary-foreground font-semibold shadow hover:bg-primary/90 transition disabled:opacity-60"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-3A2.25 2.25 0 008.25 5.25V9m7.5 0v10.5A2.25 2.25 0 0113.5 21h-3A2.25 2.25 0 018.25 19.5V9m7.5 0H8.25" />
+                </svg>
+                {documentUploaded ? "Adjuntar nuevo archivo" : "Adjuntar archivo"}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.docx,.txt"
+                className="hidden"
+                onChange={handleFileChange}
+                disabled={uploading}
+              />
+              <button
+                type="submit"
+                className="px-6 py-2 rounded-full bg-primary text-primary-foreground font-semibold shadow hover:bg-primary/90 transition disabled:opacity-60"
+                disabled={loading || !query.trim() || !documentUploaded}
+              >
+                {loading ? "Consultando..." : "Consultar"}
+              </button>
+            </div>
+          </form>
+          {response && (
+            <div className="mt-8 space-y-6">
+              <div className="bg-card rounded-xl p-5 shadow">
+                <h2 className="font-semibold mb-2">Respuesta</h2>
+                <div className="prose prose-neutral dark:prose-invert" style={{ margin: 0, padding: 0}}>
+                  <style>{`
+                    .prose p { margin: 0 !important; }
+                    .prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 { margin: 0 !important; }
+                    .prose h1 + p,
+                    .prose h2 + p,
+                    .prose h3 + p,
+                    .prose h4 + p,
+                    .prose h5 + p,
+                    .prose h6 + p { margin-top: 0 !important; }
+                  `}</style>
+                  <ReactMarkdown skipHtml={false}>
+                    {formatAnswer(response.answer)}
+                  </ReactMarkdown>
                 </div>
               </div>
-            </form>
-          </div>
-
-          {error && (
-            <div className="px-6 pb-6">
-              <Alert variant="destructive" className="bg-red-50 text-red-800 border-red-200">
-                <AlertCircle className="h-4 w-4" />
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            </div>
-          )}
-
-          {(isLoading || response) && (
-            <div className="border-t border-gray-200">
-              <div className="p-6">
-                <div className="flex items-center gap-2 mb-3">
-                  <div className="bg-blue-100 p-1.5 rounded-full">
-                    <svg
-                      className="h-5 w-5 text-blue-600"
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <circle cx="12" cy="12" r="10"></circle>
-                      <line x1="12" y1="16" x2="12" y2="12"></line>
-                      <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                    </svg>
-                  </div>
-                  <h2 className="font-medium text-lg">Respuesta</h2>
-                </div>
-
-                <Card className="border-0 bg-gray-50 overflow-hidden">
-                  <div className="p-4">
-                    {isLoading ? (
-                      <div className="flex flex-col items-center justify-center py-8">
-                        <div className="relative">
-                          <div className="h-16 w-16 rounded-full border-4 border-gray-200 border-t-blue-600 animate-spin"></div>
-                          <div className="absolute inset-0 flex items-center justify-center">
-                            <Loader2 className="h-8 w-8 text-blue-600 animate-pulse" />
-                          </div>
-                        </div>
-                        <p className="mt-4 text-gray-500 text-center">
-                          Buscando respuesta para: <span className="font-medium text-gray-700">"{query}"</span>
-                        </p>
-                      </div>
-                    ) : (
-                      <div className="animate-fade-in">
-                        <p className="whitespace-pre-line text-base leading-relaxed text-gray-700">
-                          {response?.answer}
-                        </p>
-                        {response?.rewritten_query !== response?.original_query && (
-                          <div className="mt-4 text-xs text-gray-500 border-t border-gray-200 pt-2">
-                            <span className="font-medium">Consulta optimizada:</span> {response?.rewritten_query}
-                          </div>
+              {response.sources && response.sources.length > 0 && (
+                <div className="space-y-2">
+                  <h3 className="font-semibold">Fuentes</h3>
+                  {dedupedSources(response.sources).map((src: any, idx: number) => (
+                    <div key={idx} className="bg-muted rounded-lg p-4">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-sm font-medium">{src.source}</span>
+                        {src.page && (
+                          <span className="text-xs text-muted-foreground">Página {src.page}</span>
                         )}
                       </div>
-                    )}
-                  </div>
-                </Card>
-              </div>
-
-              {response && response.sources.length > 0 && (
-                <div className="border-t border-gray-200">
-                  <div className="p-6">
-                    <div className="flex items-center gap-2 mb-4">
-                      <div className="bg-amber-100 p-1.5 rounded-full">
-                        <svg
-                          className="h-5 w-5 text-amber-600"
-                          xmlns="http://www.w3.org/2000/svg"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
-                          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
-                        </svg>
-                      </div>
-                      <h2 className="font-medium text-lg">Fuentes consultadas</h2>
+                      {src.content_preview && (
+                        <p className="text-xs text-muted-foreground">{src.content_preview}</p>
+                      )}
                     </div>
-
-                    <div className="grid gap-4 md:grid-cols-2">
-                      {response.sources.map((source, index) => (
-                        <Card
-                          key={index}
-                          className="h-full overflow-hidden hover:shadow-md transition-shadow duration-300 border-gray-200"
-                        >
-                          <div className="bg-gray-50 p-3 border-b border-gray-200 flex items-center gap-2">
-                            <FileText className="h-4 w-4 text-gray-500" />
-                            <p className="font-medium text-sm truncate">{source.file}</p>
-                          </div>
-                          <div className="p-4">
-                            <p className="text-sm text-gray-600 line-clamp-4 leading-relaxed">{source.snippet}</p>
-                          </div>
-                        </Card>
-                      ))}
-                    </div>
-                  </div>
+                  ))}
                 </div>
               )}
             </div>
           )}
+          {uploading && (
+            <div className="text-center text-primary animate-pulse mt-4">Procesando documento...</div>
+          )}
         </div>
+        <Toaster />
       </div>
     </main>
-  )
+  );
 }

@@ -22,7 +22,7 @@ from langdetect import detect, LangDetectException
 from asyncio import TimeoutError
 import async_timeout
 
-from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -43,10 +43,13 @@ from langchain_deepseek import ChatDeepSeek
 from langchain.callbacks.manager import CallbackManager
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 
+from .translation import translate_text
+
 from transformers import pipeline
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
-from .translation import translate_text
+import shutil
+import subprocess
 
 # MODIFICADO: Configuración de logging mejorada
 logging.basicConfig(
@@ -875,6 +878,50 @@ async def query_documents(
             status_code=500,
             detail="Internal server error"
         )
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    allowed_extensions = {"pdf", "docx", "txt"}
+    filename = file.filename
+    ext = filename.split(".")[-1].lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Tipo de archivo no soportado. Solo PDF, DOCX y TXT.")
+
+    docs_dir = os.path.join(os.path.dirname(__file__), "../docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    file_path = os.path.join(docs_dir, filename)
+
+    # Guardar archivo
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        logger.error(f"Error guardando archivo: {e}")
+        raise HTTPException(status_code=500, detail="Error al guardar el archivo.")
+
+    # Usar el Python del entorno actual
+    python_exec = sys.executable
+    logger.info(f"Usando Python para ingest: {python_exec}")
+
+    # Ejecutar ingest.py como subproceso para indexar SOLO este archivo
+    try:
+        ingest_path = os.path.join(os.path.dirname(__file__), "../ingest.py")
+        result = subprocess.run([
+            python_exec, ingest_path,
+            "--docs-dir", docs_dir,
+            "--extensions", ext
+        ], capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            logger.error(f"Error en ingest.py: {result.stderr}")
+            raise HTTPException(status_code=500, detail=f"Error al procesar el documento: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logger.error("Ingest timeout")
+        raise HTTPException(status_code=500, detail="El procesamiento del documento excedió el tiempo límite.")
+    except Exception as e:
+        logger.error(f"Error ejecutando ingest.py: {e}")
+        raise HTTPException(status_code=500, detail="Error al indexar el documento.")
+
+    return {"detail": "Documento procesado correctamente"}
 
 # MODIFICADO: Punto de entrada mejorado
 if __name__ == "__main__":
