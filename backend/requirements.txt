@@ -11,6 +11,7 @@ nest_asyncio
 sentence-transformers
 transformers
 sentencepiece
+supabase
 accelerate
 sacremoses
 huggingface-hub

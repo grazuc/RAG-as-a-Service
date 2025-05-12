@@ -22,7 +22,7 @@ from langdetect import detect, LangDetectException
 from asyncio import TimeoutError
 import async_timeout
 
-from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -50,6 +50,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
 import shutil
 import subprocess
+from supabase import create_client, Client  # pip install supabase
 
 # MODIFICADO: Configuración de logging mejorada
 logging.basicConfig(
@@ -95,6 +96,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 # MODIFICADO: Funciones cacheadas para componentes
 @lru_cache(maxsize=1)
@@ -454,6 +456,8 @@ class QueryRequest(BaseModel):
     query: str
     language: Optional[str] = None
     detailed_feedback: bool = False
+    userId: Optional[str] = None
+    documentId: Optional[str] = None
     model_config = ConfigDict(extra="forbid")
 
     @validator("query")
@@ -677,6 +681,45 @@ async def perform_retrieval_with_timeout(retriever, query: str, timeout: int) ->
         logger.warning(f"Retrieval timeout for query: {query[:100]}...")
         return []
 
+# Initialize Supabase client (do this at the top-level, not per-request)
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def get_vectorstore_for_collection(collection_name: str):
+    """Return a vectorstore for a specific collection (no cache)."""
+    return PGVector(
+        embedding_function=get_embeddings(),
+        collection_name=collection_name,
+        connection_string=settings.pg_conn
+    )
+
+def get_retriever_for_collection(collection_name: str):
+    """Return a retriever for a specific collection (no cache)."""
+    vectorstore = get_vectorstore_for_collection(collection_name)
+    base_retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": settings.initial_retrieval_k,
+            "filter": {},
+            "batch_size": settings.batch_size
+        }
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cross_enc = HuggingFaceCrossEncoder(
+        model_name=settings.reranker_model,
+        model_kwargs={"device": device}
+    )
+    reranker = CrossEncoderReranker(
+        model=cross_enc, 
+        top_n=settings.final_docs_count
+    )
+    return ContextualCompressionRetriever(
+        base_compressor=reranker,
+        base_retriever=base_retriever,
+    )
+
 @app.post("/query", response_model=QueryResponse)
 async def query_documents(
     request_data: QueryRequest,
@@ -688,6 +731,21 @@ async def query_documents(
     start_time = time.time()
     
     try:
+        userId = request_data.userId
+        documentId = request_data.documentId
+
+        # Dynamic collection name
+        collection_name = settings.collection_name
+        if userId and documentId:
+            collection_name = f"{userId}_{documentId}"
+
+        # Use custom retriever for this collection
+        retriever = get_retriever_for_collection(collection_name)
+
+        # --- Supabase logic example (fetch user metadata) ---
+        # user_meta = supabase.table("users").select("*").eq("id", userId).single().execute()
+        # logger.info(f"User metadata: {user_meta.data}")
+
         # Validación de entrada
         if not request_data.query.strip():
             raise HTTPException(
@@ -737,7 +795,6 @@ async def query_documents(
                 query_to_use = f"{original_query} | {rewritten_query}" if rewritten_query else original_query
                 
             # Recuperar documentos usando el nuevo método invoke
-            retriever = get_retriever()
             raw_source_docs = await perform_retrieval_with_timeout(
                 retriever, 
                 query_to_use,
@@ -880,18 +937,28 @@ async def query_documents(
         )
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    userId: str = Form(None),
+    documentId: str = Form(None)
+):
     allowed_extensions = {"pdf", "docx", "txt"}
     filename = file.filename
     ext = filename.split(".")[-1].lower()
     if ext not in allowed_extensions:
         raise HTTPException(status_code=400, detail="Tipo de archivo no soportado. Solo PDF, DOCX y TXT.")
 
+    # Create a user-specific directory if userId is provided
     docs_dir = os.path.join(os.path.dirname(__file__), "../docs")
+    if userId:
+        docs_dir = os.path.join(docs_dir, userId)
+        if documentId:
+            docs_dir = os.path.join(docs_dir, documentId)
+    
     os.makedirs(docs_dir, exist_ok=True)
     file_path = os.path.join(docs_dir, filename)
 
-    # Guardar archivo
+    # Save file
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -899,18 +966,27 @@ async def upload_document(file: UploadFile = File(...)):
         logger.error(f"Error guardando archivo: {e}")
         raise HTTPException(status_code=500, detail="Error al guardar el archivo.")
 
-    # Usar el Python del entorno actual
+    # Use the Python of the current environment
     python_exec = sys.executable
     logger.info(f"Usando Python para ingest: {python_exec}")
 
-    # Ejecutar ingest.py como subproceso para indexar SOLO este archivo
+    # Run ingest.py as a subprocess to index ONLY this file
     try:
         ingest_path = os.path.join(os.path.dirname(__file__), "../ingest.py")
+        
+        # Add collection name based on user and document if provided
+        collection_name = settings.collection_name
+        if userId and documentId:
+            collection_name = f"{userId}_{documentId}"
+        
         result = subprocess.run([
             python_exec, ingest_path,
             "--docs-dir", docs_dir,
-            "--extensions", ext
+            "--extensions", ext,
+            "--collection", collection_name,
+            "--reset-cache",
         ], capture_output=True, text=True, timeout=600)
+        
         if result.returncode != 0:
             logger.error(f"Error en ingest.py: {result.stderr}")
             raise HTTPException(status_code=500, detail=f"Error al procesar el documento: {result.stderr}")
