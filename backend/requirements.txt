@@ -10,18 +10,13 @@ nest_asyncio
 
 sentence-transformers
 transformers
-sentencepiece
-supabase
-accelerate
-sacremoses
-huggingface-hub
+torch==2.2.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 pypdfium2
-torch
-langchain-huggingface
-
 psycopg2-binary
 pgvector
-
 pydantic
-pypdf
 langdetect
+supabase
+tqdm
+numpy
+psutil
