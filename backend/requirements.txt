@@ -8,7 +8,6 @@ langchain-huggingface
 langchain-deepseek
 nest_asyncio
 
-sentence-transformers
 transformers
 torch==2.2.0
 pypdfium2
