@@ -10,7 +10,7 @@ nest_asyncio
 
 sentence-transformers
 transformers
-torch==2.2.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
+torch==2.2.0
 pypdfium2
 psycopg2-binary
 pgvector
